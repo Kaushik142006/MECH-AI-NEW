@@ -950,6 +950,80 @@ def make_hardcoded_pulley(stl_path):
     )
 
 
+def make_hinge(leaf_l, leaf_w, leaf_t, pin_d, knuckle_d, stl_path, knuckle_count=5, hole_d=4.0, holes_per_leaf=3):
+    """
+    Parametric butt hinge:
+    - two rectangular leaves
+    - alternating knuckles at the center seam
+    - through pin bore
+    - mounting holes on both leaves
+    """
+    leaf_l = max(float(leaf_l), 20.0)
+    leaf_w = max(float(leaf_w), 20.0)
+    leaf_t = max(float(leaf_t), 1.5)
+    knuckle_count = max(int(round(knuckle_count)), 3)
+    if knuckle_count % 2 == 0:
+        knuckle_count += 1
+    knuckle_d = max(float(knuckle_d), leaf_t * 1.6)
+    pin_d = max(min(float(pin_d), knuckle_d * 0.9), 1.5)
+    hole_d = max(float(hole_d), 1.5)
+    holes_per_leaf = max(int(round(holes_per_leaf)), 2)
+    return (
+        "from build123d import *\n"
+        f"leaf_l = {leaf_l}\n"
+        f"leaf_w = {leaf_w}\n"
+        f"leaf_t = {leaf_t}\n"
+        f"pin_d = {pin_d}\n"
+        f"knuckle_d = {knuckle_d}\n"
+        f"knuckle_count = {knuckle_count}\n"
+        f"hole_d = {hole_d}\n"
+        f"holes_per_leaf = {holes_per_leaf}\n"
+        "with BuildPart() as b:\n"
+        "    gap = max(leaf_t * 0.10, 0.25)\n"
+        "    knuckle_r = knuckle_d / 2.0\n"
+        "    pin_r = pin_d / 2.0\n"
+        "    knuckle_z = leaf_t * 0.55\n"
+        "\n"
+        "    # Two hinge leaves\n"
+        "    with BuildSketch(Plane.XY):\n"
+        "        with Locations((-(leaf_l / 2.0 + gap / 2.0), 0)):\n"
+        "            Rectangle(leaf_l, leaf_w)\n"
+        "        with Locations(((leaf_l / 2.0 + gap / 2.0), 0)):\n"
+        "            Rectangle(leaf_l, leaf_w)\n"
+        "    extrude(amount=leaf_t)\n"
+        "\n"
+        "    # Alternating knuckles along hinge axis (Y axis)\n"
+        "    seg = leaf_w / knuckle_count\n"
+        "    clear = max(seg * 0.16, 0.35)\n"
+        "    for i in range(knuckle_count):\n"
+        "        y0 = -leaf_w / 2.0 + i * seg + clear * 0.5\n"
+        "        seg_len = max(seg - clear, seg * 0.5)\n"
+        "        xk = -gap * 0.5 if (i % 2 == 0) else gap * 0.5\n"
+        "        with BuildSketch(Plane.XZ.offset(y0)):\n"
+        "            with Locations((xk, knuckle_z)):\n"
+        "                Circle(radius=knuckle_r)\n"
+        "        extrude(amount=seg_len)\n"
+        "\n"
+        "    # Pin bore through all knuckles\n"
+        "    with BuildSketch(Plane.XZ.offset(-leaf_w / 2.0 - 0.5)):\n"
+        "        Circle(radius=pin_r)\n"
+        "    extrude(amount=leaf_w + 1.0, mode=Mode.SUBTRACT)\n"
+        "\n"
+        "    # Mounting holes on both leaves\n"
+        "    x_off = leaf_l * 0.30\n"
+        "    y_span = leaf_w * 0.70\n"
+        "    for i in range(holes_per_leaf):\n"
+        "        yi = (-y_span / 2.0) + (y_span * i / max(holes_per_leaf - 1, 1))\n"
+        "        with BuildSketch(Plane.XY):\n"
+        "            with Locations((-(leaf_l / 2.0 + gap / 2.0) - x_off, yi)):\n"
+        "                Circle(radius=hole_d / 2.0)\n"
+        "            with Locations(((leaf_l / 2.0 + gap / 2.0) + x_off, yi)):\n"
+        "                Circle(radius=hole_d / 2.0)\n"
+        "        extrude(amount=leaf_t, mode=Mode.SUBTRACT)\n"
+        f"export_stl(b.part, '{stl_path}')\n"
+    )
+
+
 def make_stepped_shaft(section_diams, section_lengths, stl_path):
     return (
         "from build123d import *\n"
@@ -1029,6 +1103,8 @@ def detect_object(summary: str) -> str:
         return "nut"
     if "washer" in s:
         return "washer"
+    if any(w in s for w in ["hinge", "door hinge", "butt hinge"]):
+        return "hinge"
     if any(w in s for w in ["bracket", "angle bracket", "l-bracket", "l bracket"]):
         return "bracket"
     if any(w in s for w in ["plate", "flat plate", "base plate", "mounting plate"]):
@@ -1376,7 +1452,44 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         code = make_bushing(inner_r, outer_r, height, safe_path)
 
     elif obj == "pulley":
-        code = make_hardcoded_pulley(safe_path)
+        od_in = _extract_labeled_value(summary, [r"Outer\s*Dia(?:meter)?", r"OD", r"Pulley\s*Dia(?:meter)?", r"Diameter"])
+        fw_in = _extract_labeled_value(summary, [r"Face\s*Width", r"Width", r"Thickness"])
+        bore_in = _extract_labeled_value(summary, [r"Bore\s*Dia(?:meter)?", r"Inner\s*Dia(?:meter)?", r"Shaft\s*Dia(?:meter)?"])
+        groove_in = _extract_labeled_value(summary, [r"Groove\s*Dia(?:meter)?"])
+        hub_in = _extract_labeled_value(summary, [r"Hub\s*Dia(?:meter)?"])
+        flange_t_in = _extract_labeled_value(summary, [r"Flange\s*Thickness", r"Rim\s*Thickness"])
+
+        outer_d = float(od_in if od_in is not None else (dims[0] if len(dims) >= 1 else 80.0))
+        face_w = float(fw_in if fw_in is not None else (dims[1] if len(dims) >= 2 else max(outer_d * 0.35, 24.0)))
+        bore_d = float(bore_in if bore_in is not None else (dims[2] if len(dims) >= 3 else max(outer_d * 0.25, 12.0)))
+        groove_d = float(groove_in if groove_in is not None else (dims[3] if len(dims) >= 4 else outer_d * 0.82))
+        hub_d = float(hub_in if hub_in is not None else (dims[4] if len(dims) >= 5 else outer_d * 0.42))
+        flange_t = float(flange_t_in if flange_t_in is not None else (dims[5] if len(dims) >= 6 else face_w * 0.30))
+
+        code = make_pulley(outer_d, face_w, bore_d, safe_path, groove_d, hub_d, flange_t)
+
+    elif obj == "hinge":
+        # Order (numeric fallback): leaf length, leaf width, leaf thickness,
+        # pin dia, knuckle dia, knuckle count, hole dia, holes per leaf
+        leaf_l_in = _extract_labeled_value(summary, [r"Leaf\s*Length", r"Length", r"L\b"])
+        leaf_w_in = _extract_labeled_value(summary, [r"Leaf\s*Width", r"Width", r"W\b"])
+        leaf_t_in = _extract_labeled_value(summary, [r"Leaf\s*Thickness", r"Thickness", r"T\b"])
+        pin_d_in = _extract_labeled_value(summary, [r"Pin\s*Dia(?:meter)?", r"Pin"])
+        knuckle_d_in = _extract_labeled_value(summary, [r"Knuckle\s*Dia(?:meter)?", r"Barrel\s*Dia(?:meter)?"])
+        knuckle_n_in = _extract_labeled_value(summary, [r"Knuckle\s*Count", r"Knuckles"])
+        hole_d_in = _extract_labeled_value(summary, [r"Hole\s*Dia(?:meter)?", r"Mounting\s*Hole"])
+        holes_n_in = _extract_labeled_value(summary, [r"Holes?\s*Per\s*Leaf", r"Hole\s*Count"])
+
+        leaf_l = float(leaf_l_in if leaf_l_in is not None else (dims[0] if len(dims) >= 1 else 55.0))
+        leaf_w = float(leaf_w_in if leaf_w_in is not None else (dims[1] if len(dims) >= 2 else 26.0))
+        leaf_t = float(leaf_t_in if leaf_t_in is not None else (dims[2] if len(dims) >= 3 else 4.0))
+        pin_d = float(pin_d_in if pin_d_in is not None else (dims[3] if len(dims) >= 4 else 5.0))
+        knuckle_d = float(knuckle_d_in if knuckle_d_in is not None else (dims[4] if len(dims) >= 5 else 8.0))
+        knuckle_n = int(round(knuckle_n_in if knuckle_n_in is not None else (dims[5] if len(dims) >= 6 else 5)))
+        hole_d = float(hole_d_in if hole_d_in is not None else (dims[6] if len(dims) >= 7 else 4.0))
+        holes_n = int(round(holes_n_in if holes_n_in is not None else (dims[7] if len(dims) >= 8 else 3)))
+
+        code = make_hinge(leaf_l, leaf_w, leaf_t, pin_d, knuckle_d, safe_path, knuckle_n, hole_d, holes_n)
 
     elif obj == "shaft":
         if len(dims) >= 4:
@@ -1698,7 +1811,7 @@ def should_use_deterministic_pipeline(summary: str) -> bool:
 
     # Always use deterministic generators for these primitives/components.
     # They are fully parametric and should not go through the LLM validator loop.
-    if obj in {"spring", "rivet", "cone", "pulley"}:
+    if obj in {"spring", "rivet", "cone", "pulley", "hinge"}:
         return True
 
     s = summary.lower()
@@ -1722,7 +1835,7 @@ def should_use_deterministic_pipeline(summary: str) -> bool:
     if any(keyword in s for keyword in complex_keywords):
         return False
 
-    return obj in {"box", "cylinder", "plate", "bracket", "washer", "bushing", "shaft", "spring", "rivet", "cone", "pulley"}
+    return obj in {"box", "cylinder", "plate", "bracket", "washer", "bushing", "shaft", "spring", "rivet", "cone", "pulley", "hinge"}
 
 
 def _cache_key(*parts: str) -> str:
@@ -2323,9 +2436,24 @@ def run_pipeline(summary: str):
     detected_obj = detect_object(summary)
     classified_obj = classify_object(summary)
 
-    # ── HARD ROUTE: PULLEY (fixed model, no LLM, no placeholder dimensions) ──
+    # ── HARD ROUTE: PULLEY (dimension-driven, no LLM) ────────────────────────
     if detected_obj == "pulley":
-        code = make_hardcoded_pulley(STL_PATH.replace("\\", "/"))
+        dims = parse_dims(normalized_summary)
+        od_in = _extract_labeled_value(normalized_summary, [r"Outer\s*Dia(?:meter)?", r"OD", r"Pulley\s*Dia(?:meter)?", r"Diameter"])
+        fw_in = _extract_labeled_value(normalized_summary, [r"Face\s*Width", r"Width", r"Thickness"])
+        bore_in = _extract_labeled_value(normalized_summary, [r"Bore\s*Dia(?:meter)?", r"Inner\s*Dia(?:meter)?", r"Shaft\s*Dia(?:meter)?"])
+        groove_in = _extract_labeled_value(normalized_summary, [r"Groove\s*Dia(?:meter)?"])
+        hub_in = _extract_labeled_value(normalized_summary, [r"Hub\s*Dia(?:meter)?"])
+        flange_t_in = _extract_labeled_value(normalized_summary, [r"Flange\s*Thickness", r"Rim\s*Thickness"])
+
+        outer_d = float(od_in if od_in is not None else (dims[0] if len(dims) >= 1 else 80.0))
+        face_w = float(fw_in if fw_in is not None else (dims[1] if len(dims) >= 2 else max(outer_d * 0.35, 24.0)))
+        bore_d = float(bore_in if bore_in is not None else (dims[2] if len(dims) >= 3 else max(outer_d * 0.25, 12.0)))
+        groove_d = float(groove_in if groove_in is not None else (dims[3] if len(dims) >= 4 else outer_d * 0.82))
+        hub_d = float(hub_in if hub_in is not None else (dims[4] if len(dims) >= 5 else outer_d * 0.42))
+        flange_t = float(flange_t_in if flange_t_in is not None else (dims[5] if len(dims) >= 6 else face_w * 0.30))
+
+        code = make_pulley(outer_d, face_w, bore_d, STL_PATH.replace("\\", "/"), groove_d, hub_d, flange_t)
         path = execute_code(code, STL_PATH, normalized_summary)
         _PIPELINE_CACHE[cache_id] = path
         print(f"[Deterministic-Pulley] SUCCESS - {path}")
