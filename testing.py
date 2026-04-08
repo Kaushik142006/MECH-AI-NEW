@@ -12,10 +12,12 @@ from build123d import (
 import gradio as gr
 import os
 import re
+import shutil
 import traceback
 import tempfile
 import subprocess
 import sys
+import uuid
 from openai import OpenAI
 
 # ── Ollama client ────────────────────────────────────────────────────────
@@ -24,6 +26,15 @@ client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 STL_PATH = os.path.join(MODEL_DIR, "model.stl").replace("\\", "/")
+
+
+def prepare_viewer_model(stl_path: str) -> str | None:
+    if not stl_path or not os.path.exists(stl_path):
+        return None
+
+    viewer_path = os.path.join(MODEL_DIR, f"viewer_{uuid.uuid4().hex}.stl")
+    shutil.copy2(stl_path, viewer_path)
+    return viewer_path.replace("\\", "/")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -153,6 +164,23 @@ def make_bushing(inner_r, outer_r, height, stl_path):
     )
 
 
+def make_stepped_shaft(section_diams, section_lengths, stl_path):
+    """Solid stepped shaft with sections stacked along one axis."""
+    return (
+        "from build123d import *\n"
+        f"section_diams = {list(section_diams)}\n"
+        f"section_lengths = {list(section_lengths)}\n"
+        "with BuildPart() as b:\n"
+        "    z_offset = 0.0\n"
+        "    for dia, seg_len in zip(section_diams, section_lengths):\n"
+        "        with BuildSketch(Plane.XY.offset(z_offset)):\n"
+        "            Circle(radius=dia / 2.0)\n"
+        "        extrude(amount=seg_len)\n"
+        "        z_offset += seg_len\n"
+        f"export_stl(b.part, '{stl_path}')\n"
+    )
+
+
 def make_bracket(base_l, base_w, wall_h, thickness, stl_path):
     """L-shaped bracket: horizontal base + vertical wall."""
     return (
@@ -217,17 +245,23 @@ def generate_fallback(summary: str, stl_path: str) -> str:
 
     # ── Assign dimensions with sensible defaults per object type ──────────
     if obj == "screw":
-        shaft_r   = (dims[0] / 2) if len(dims) >= 1 else 3.0
-        shaft_len = dims[1]        if len(dims) >= 2 else 20.0
-        head_r    = (dims[2] / 2) if len(dims) >= 3 else shaft_r * 1.8
-        head_h    = max(shaft_r * 0.7, 3.0)
+        shaft_dia = _extract_labeled_value(summary, [r"Shaft\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"])
+        head_dia  = _extract_labeled_value(summary, [r"Head\s+Dia(?:meter)?"])
+        head_h_in = _extract_labeled_value(summary, [r"Head\s+Height", r"Head\s+Thickness"])
+        shaft_r   = ((shaft_dia or (dims[0] if len(dims) >= 1 else 6.0)) / 2)
+        shaft_len = _extract_labeled_value(summary, [r"Length", r"Shaft\s+Length"]) or (dims[1] if len(dims) >= 2 else 20.0)
+        head_r    = ((head_dia or (dims[2] if len(dims) >= 3 else shaft_r * 3.6)) / 2)
+        head_h    = head_h_in or (dims[3] if len(dims) >= 4 else max(shaft_r * 0.7, 3.0))
         code = make_screw(shaft_r, head_r, shaft_len, head_h, safe_path)
 
     elif obj == "bolt":
-        shaft_r   = (dims[0] / 2) if len(dims) >= 1 else 5.0
-        shaft_len = dims[1]        if len(dims) >= 2 else 30.0
-        head_r    = (dims[2] / 2) if len(dims) >= 3 else shaft_r * 1.8
-        head_h    = max(shaft_r * 0.7, 4.0)
+        shaft_dia = _extract_labeled_value(summary, [r"Shaft\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"])
+        head_dia  = _extract_labeled_value(summary, [r"Head\s+Dia(?:meter)?"])
+        head_h_in = _extract_labeled_value(summary, [r"Head\s+Height", r"Head\s+Thickness"])
+        shaft_r   = ((shaft_dia or (dims[0] if len(dims) >= 1 else 10.0)) / 2)
+        shaft_len = _extract_labeled_value(summary, [r"Length", r"Shaft\s+Length"]) or (dims[1] if len(dims) >= 2 else 30.0)
+        head_r    = ((head_dia or (dims[2] if len(dims) >= 3 else shaft_r * 3.6)) / 2)
+        head_h    = head_h_in or (dims[3] if len(dims) >= 4 else max(shaft_r * 0.7, 4.0))
         code = make_hex_bolt(shaft_r, head_r, shaft_len, head_h, safe_path)
 
     elif obj in ("nut", "washer"):
@@ -255,11 +289,22 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         hole_r    = dims[3] / 2 if len(dims) >= 4 else 4.0
         code = make_plate_with_holes(length, width, thickness, hole_r, 4, safe_path)
 
-    elif obj in ("bushing", "shaft"):
+    elif obj == "bushing":
         outer_r = (dims[0] / 2) if len(dims) >= 1 else 10.0
         inner_r = (dims[1] / 2) if len(dims) >= 2 else outer_r * 0.5
         height  = dims[2]        if len(dims) >= 3 else 20.0
         code = make_bushing(inner_r, outer_r, height, safe_path)
+
+    elif obj == "shaft":
+        if len(dims) >= 4:
+            usable_count = len(dims) - (len(dims) % 2)
+            section_diams = dims[:usable_count:2]
+            section_lengths = dims[1:usable_count:2]
+            code = make_stepped_shaft(section_diams, section_lengths, safe_path)
+        else:
+            radius = (dims[0] / 2) if len(dims) >= 1 else 10.0
+            height = dims[1]        if len(dims) >= 2 else 20.0
+            code = make_cylinder(radius, height, safe_path)
 
     elif obj == "cylinder":
         radius = (dims[0] / 2) if len(dims) >= 1 else 10.0
@@ -279,7 +324,116 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         code = make_cylinder(radius, height, safe_path)
 
     print("[Fallback] Code:\n", code)
-    return execute_code(code, stl_path)
+    return execute_code(code, stl_path, summary)
+
+
+def build_direct_summary(user_message: str) -> str | None:
+    text = user_message.strip()
+    if not text:
+        return None
+
+    if "all required parameters collected" in text.lower():
+        return text
+
+    obj = detect_object(text)
+    dims = parse_dims(text)
+    lowered = text.lower()
+
+    if obj == "screw":
+        if len(dims) < 3:
+            return None
+        shaft_dia = _extract_labeled_value(text, [r"Shaft\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"]) or dims[0]
+        length = _extract_labeled_value(text, [r"Length", r"Shaft\s+Length"]) or (dims[1] if len(dims) >= 2 else 20.0)
+        head_dia = _extract_labeled_value(text, [r"Head\s+Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else shaft_dia * 1.8)
+        head_h = _extract_labeled_value(text, [r"Head\s+Height", r"Head\s+Thickness"])
+        if head_h is None and len(dims) >= 5:
+            head_h = dims[3]
+        shape = "Round Head" if "flat" not in lowered and "hex" not in lowered else (
+            "Flat Head" if "flat" in lowered else "Hex Head"
+        )
+        pitch = _extract_labeled_value(text, [r"Thread\s+Pitch", r"Pitch"])
+        if pitch is None:
+            if len(dims) >= 5:
+                pitch = dims[4]
+            elif len(dims) >= 4 and head_h is None:
+                pitch = dims[3]
+            else:
+                pitch = max(0.8, round(shaft_dia * 0.15, 2))
+        features = "External Threads"
+        if "center hole" in lowered:
+            features += " / Center Hole"
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            f"- Object: Screw\n"
+            f"- Dimensions: Shaft Dia={shaft_dia}mm, Length={length}mm, Head Diameter={head_dia}mm, Head Height={head_h or max((shaft_dia / 2) * 0.7, 3.0)}mm, Thread Pitch={pitch}mm\n"
+            f"- Shape: {shape}\n"
+            f"- Features: {features}\n"
+            "Now the design process will be started."
+        )
+
+    if obj == "bolt":
+        if len(dims) < 3:
+            return None
+        shaft_dia = _extract_labeled_value(text, [r"Shaft\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"]) or dims[0]
+        length = _extract_labeled_value(text, [r"Length", r"Shaft\s+Length"]) or (dims[1] if len(dims) >= 2 else 30.0)
+        head_dia = _extract_labeled_value(text, [r"Head\s+Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else shaft_dia * 1.8)
+        head_h = _extract_labeled_value(text, [r"Head\s+Height", r"Head\s+Thickness"])
+        if head_h is None and len(dims) >= 5:
+            head_h = dims[3]
+        pitch = _extract_labeled_value(text, [r"Thread\s+Pitch", r"Pitch"])
+        if pitch is None:
+            if len(dims) >= 5:
+                pitch = dims[4]
+            elif len(dims) >= 4 and head_h is None:
+                pitch = dims[3]
+            else:
+                pitch = max(0.8, round(shaft_dia * 0.15, 2))
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            f"- Object: Hex Bolt\n"
+            f"- Dimensions: Shaft Dia={shaft_dia}mm, Length={length}mm, Head Diameter={head_dia}mm, Head Height={head_h or max((shaft_dia / 2) * 0.7, 4.0)}mm, Thread Pitch={pitch}mm\n"
+            f"- Shape: Hex Head\n"
+            f"- Features: External Threads\n"
+            "Now the design process will be started."
+        )
+
+    if obj == "nut":
+        if len(dims) < 3:
+            return None
+        pitch = _extract_labeled_value(text, [r"Thread\s+Pitch", r"Pitch"])
+        pitch = pitch or (dims[3] if len(dims) >= 4 else max(0.8, round(dims[0] * 0.15, 2)))
+        shape = "Hexagonal" if "hex" in lowered else "Circular"
+        object_name = "Hex Nut" if "hex" in lowered else "Nut"
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            f"- Object: {object_name}\n"
+            f"- Dimensions: Inner Dia={dims[0]}mm, Outer Dia={dims[1]}mm, Thickness={dims[2]}mm, Thread Pitch={pitch}mm\n"
+            f"- Shape: {shape}\n"
+            f"- Features: Internal Threads\n"
+            "Now the design process will be started."
+        )
+
+    if obj == "washer":
+        if len(dims) < 3:
+            return None
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            f"- Object: Washer\n"
+            f"- Dimensions: Inner Dia={dims[0]}mm, Outer Dia={dims[1]}mm, Thickness={dims[2]}mm\n"
+            f"- Shape: Circular\n"
+            f"- Features: Center Hole\n"
+            "Now the design process will be started."
+        )
+
+    return None
+
+
+def should_use_deterministic_pipeline(summary: str) -> bool:
+    return detect_object(summary) != "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -361,6 +515,7 @@ CRITICAL RULES:
 7. NEVER omit a feature that appears in the summary.
 8. NEVER replace a threaded shaft with a plain cylinder.
 9. NEVER replace an internal thread with a plain Hole().
+10. Output ENGLISH ONLY. Do not use Chinese or any other language.
 
 Output ONLY the structured blueprint (Steps 1–4). No code, no preamble."""
 
@@ -495,7 +650,198 @@ def patch_export(code: str, stl_path: str) -> str:
     return "\n".join(out)
 
 
-def execute_code(code: str, stl_path: str) -> str:
+THREAD_TRIGGER_KEYWORDS = (
+    "thread",
+    "threaded",
+    "screw",
+    "bolt",
+    "stud",
+    "nut",
+)
+
+
+def threads_required(summary: str) -> bool:
+    s = summary.lower()
+    return any(keyword in s for keyword in THREAD_TRIGGER_KEYWORDS)
+
+
+def detect_thread_mode(summary: str) -> str | None:
+    s = summary.lower()
+    if "nut" in s:
+        return "internal"
+    if any(keyword in s for keyword in ("screw", "bolt", "stud", "threaded rod", "threaded")):
+        return "external"
+    return None
+
+
+def _extract_labeled_value(summary: str, labels) -> float | None:
+    for label in labels:
+        pattern = rf"{label}(?:\s+is)?\s*(?:=|:)?\s*(\d+(?:\.\d+)?)"
+        match = re.search(pattern, summary, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def infer_thread_parameters(summary: str) -> dict | None:
+    if not threads_required(summary):
+        return None
+
+    s = summary.lower()
+    dims = parse_dims(summary)
+    mode = detect_thread_mode(summary)
+    if mode is None:
+        return None
+
+    pitch = _extract_labeled_value(summary, [r"Thread\s+Pitch", r"Pitch"])
+
+    if mode == "internal":
+        inner_dia = _extract_labeled_value(summary, [r"Inner\s+Dia(?:meter)?", r"Bore\s+Dia(?:meter)?"])
+        thickness = _extract_labeled_value(summary, [r"Thickness", r"Height", r"Length"])
+
+        if inner_dia is None and dims:
+            inner_dia = dims[0]
+        if thickness is None:
+            thickness = dims[2] if len(dims) >= 3 else (dims[1] if len(dims) >= 2 else 6.0)
+
+        inner_dia = inner_dia or 10.0
+        thickness = thickness or 6.0
+        pitch = pitch or max(0.8, round(inner_dia * 0.15, 2))
+
+        return {
+            "mode": "internal",
+            "inner_radius": max(inner_dia / 2.0, 0.5),
+            "length": max(thickness, pitch * 2.0),
+            "pitch": max(pitch, 0.4),
+        }
+
+    shaft_dia = _extract_labeled_value(
+        summary,
+        [r"Shaft\s+Dia(?:meter)?", r"Major\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"],
+    )
+    shaft_len = _extract_labeled_value(summary, [r"Length", r"Shaft\s+Length", r"Thread\s+Length"])
+
+    if shaft_dia is None and dims:
+        shaft_dia = dims[0]
+    if shaft_len is None:
+        if "threaded rod" in s and len(dims) >= 2:
+            shaft_len = dims[1]
+        else:
+            shaft_len = dims[1] if len(dims) >= 2 else 20.0
+
+    shaft_dia = shaft_dia or 6.0
+    shaft_len = shaft_len or 20.0
+    pitch = pitch or max(0.8, round(shaft_dia * 0.15, 2))
+
+    return {
+        "mode": "external",
+        "shaft_radius": max(shaft_dia / 2.0, 0.5),
+        "length": max(shaft_len, pitch * 2.0),
+        "pitch": max(pitch, 0.4),
+    }
+
+
+def inject_thread_postprocessing(code: str, summary: str, stl_path: str) -> str:
+    params = infer_thread_parameters(summary)
+    if not params:
+        return patch_export(code, stl_path)
+    if re.search(r"\bHelix\s*\(", code) and re.search(r"\bsweep\s*\(", code):
+        return patch_export(code, stl_path)
+
+    safe_path = stl_path.replace("\\", "/")
+    clean = patch_export(code, stl_path)
+
+    if params["mode"] == "internal":
+        apply_call = (
+            f"result_part = _mechai_apply_internal_threads(b.part, {params['inner_radius']}, "
+            f"{params['length']}, {params['pitch']})"
+        )
+    else:
+        apply_call = (
+            f"result_part = _mechai_apply_external_threads(b.part, {params['shaft_radius']}, "
+            f"{params['length']}, {params['pitch']})"
+        )
+
+    helper_block = f"""
+def _mechai_make_thread_section(path, pitch, radial_depth, root_overlap, inward=False):
+    section_plane = Plane(origin=path @ 0, z_dir=path % 0)
+    half_pitch = max(pitch * 0.22, radial_depth * 1.5)
+    root = -root_overlap
+    crest = radial_depth if not inward else -radial_depth
+    with BuildSketch(section_plane) as section:
+        Polygon(
+            (root, -half_pitch),
+            (crest, 0),
+            (root, half_pitch),
+        )
+    return section.sketch
+
+
+def _mechai_make_external_thread(radius, length, pitch):
+    radial_depth = max(min(pitch * 0.18, radius * 0.10), 0.08)
+    root_overlap = max(radial_depth * 0.55, 0.05)
+    helix_radius = max(radius - root_overlap * 0.25, 0.2)
+    path = Helix(pitch=pitch, height=length, radius=helix_radius)
+    section = _mechai_make_thread_section(path, pitch, radial_depth, root_overlap, inward=False)
+    return sweep(section, path=path)
+
+
+def _mechai_make_internal_thread(radius, length, pitch):
+    radial_depth = max(min(pitch * 0.14, radius * 0.08), 0.05)
+    root_overlap = max(radial_depth * 0.45, 0.04)
+    helix_radius = max(radius + root_overlap * 0.20, 0.2)
+    path = Helix(pitch=pitch, height=length, radius=helix_radius)
+    section = _mechai_make_thread_section(path, pitch, radial_depth, root_overlap, inward=True)
+    return sweep(section, path=path)
+
+
+def _mechai_apply_external_threads(base_part, shaft_radius, shaft_length, pitch):
+    pitch = max(float(pitch), 0.4)
+    shaft_radius = max(float(shaft_radius), 0.5)
+    shaft_length = max(float(shaft_length), pitch * 2.0)
+
+    for pitch_scale in (1.0, 1.15):
+        try:
+            thread = _mechai_make_external_thread(shaft_radius, shaft_length, pitch * pitch_scale)
+            with BuildPart() as result:
+                add(base_part)
+                add(thread, mode=Mode.ADD)
+            return result.part
+        except Exception:
+            pass
+    return base_part
+
+
+def _mechai_apply_internal_threads(base_part, inner_radius, length, pitch):
+    pitch = max(float(pitch), 0.4)
+    inner_radius = max(float(inner_radius), 0.5)
+    length = max(float(length), pitch * 2.0)
+
+    for pitch_scale in (1.0, 1.15):
+        try:
+            thread = _mechai_make_internal_thread(inner_radius, length, pitch * pitch_scale)
+            with BuildPart() as result:
+                add(base_part)
+                add(thread, mode=Mode.SUBTRACT)
+            return result.part
+        except Exception:
+            pass
+    return base_part
+"""
+
+    export_pattern = re.compile(r"^\s*export_stl\s*\([^)]*\)\s*$", flags=re.MULTILINE)
+    replacement = f"{apply_call}\nexport_stl(result_part, '{safe_path}')"
+    clean = export_pattern.sub(replacement, clean, count=1)
+
+    if (
+        "def _mechai_apply_external_threads" not in clean
+        and "def _mechai_apply_internal_threads" not in clean
+    ):
+        clean = helper_block.strip() + "\n\n" + clean.lstrip()
+    return clean
+
+
+def execute_code(code: str, stl_path: str, summary: str = "") -> str:
     """
     Execute generated build123d code in a subprocess.
     Returns the STL path on success, raises RuntimeError on failure.
@@ -508,6 +854,32 @@ def execute_code(code: str, stl_path: str) -> str:
         f"export_stl(b.part, '{safe_path}')",
         code,
     )
+    clean = inject_thread_postprocessing(clean, summary, stl_path)
+    clean = re.sub(
+        r"^\s*export_stl\s*\([^)]*\)\s*$",
+        "# MECHAI deferred export",
+        clean,
+        flags=re.MULTILINE,
+    )
+    clean = clean.rstrip() + f"""
+
+import os
+
+_mechai_export_target = None
+if "result_part" in globals() and result_part is not None:
+    _mechai_export_target = result_part
+elif "b" in globals() and hasattr(b, "part"):
+    _mechai_export_target = b.part
+
+if _mechai_export_target is None:
+    raise RuntimeError("No exportable part found in generated script.")
+
+os.makedirs(os.path.dirname(r"{safe_path}"), exist_ok=True)
+export_stl(_mechai_export_target, r"{safe_path}")
+
+if not os.path.exists(r"{safe_path}") or os.path.getsize(r"{safe_path}") == 0:
+    raise RuntimeError("STL export failed or produced an empty file.")
+"""
 
     print("\n[Engine] Executing:\n" + "=" * 40)
     print(clean)
@@ -547,15 +919,47 @@ def execute_code(code: str, stl_path: str) -> str:
 def run_pipeline(summary: str):
     print("\n" + "=" * 50 + "\n[MECHAI] Pipeline start\n" + "=" * 50)
 
+    if should_use_deterministic_pipeline(summary):
+        print("[MECHAI] Using deterministic fastener pipeline.")
+        try:
+            path = generate_fallback(summary, STL_PATH)
+            print(f"[Deterministic] SUCCESS — {path}")
+            return path
+        except Exception as e:
+            print(f"[Deterministic] Failed: {e}\n→ Falling back to LLM pipeline...")
+
     blueprint = prompt_agent(summary)
     print(f"[Agent 2] Blueprint:\n{blueprint[:400]}\n")
 
     raw_code = coder_agent(blueprint, STL_PATH)
     code = patch_export(raw_code, STL_PATH)
+
+    # ===============================gpt
+    # ✅ SIMPLE ERROR HANDLING (ADD HERE)
+    # ===============================
+    s = summary.lower()
+
+    # Fix 1: Remove unwanted holes
+    if "shaft" in s and "hole" not in s and "Hole(" in code:
+        code = code.replace("Hole(", "# removed Hole(")
+
+    # Fix 2: Add hole ONLY if clearly required
+    if "hole" in s and "Hole(" not in code:
+        code += "\n# Auto-added hole\nHole(radius=2)"
+
+    # Fix 3: FORCE threads if missing
+    if any(k in s for k in ["screw", "bolt", "thread"]) and "Helix" not in code:
+        print("⚠️ Missing threads → retrying coder_agent...")
+        
+        raw_code = coder_agent(blueprint + "\nIMPORTANT: MUST include threads using Helix + sweep", STL_PATH)
+        code = patch_export(raw_code, STL_PATH)
+
+# ===============================gpt
+
     print(f"[Agent 3] Code:\n{code[:400]}\n")
 
     try:
-        path = execute_code(code, STL_PATH)
+        path = execute_code(code, STL_PATH, summary)
         print(f"[Engine] SUCCESS — {path}")
         return path
     except Exception as e:
@@ -576,6 +980,29 @@ def run_pipeline(summary: str):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def chat_handler(user_message, history):
+    direct_summary = build_direct_summary(user_message)
+    detected_obj = detect_object(user_message)
+    if direct_summary or detected_obj != "unknown":
+        pipeline_input = direct_summary or user_message.strip()
+        bot_reply = direct_summary or (
+            "Proceeding with generation from your request.\n"
+            f"Detected object: {detected_obj.title()}"
+        )
+        stl_file = None
+        viewer_file = None
+        try:
+            stl_file = run_pipeline(pipeline_input)
+            viewer_file = prepare_viewer_model(stl_file) if stl_file else None
+            bot_reply += "\n\n✅ **3D model generated!** Check the viewer →" if stl_file \
+                         else "\n\n⚠️ Generation failed. Please try again."
+        except Exception as e:
+            print(traceback.format_exc())
+            bot_reply += f"\n\n⚠️ Error: {str(e)}"
+
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": bot_reply})
+        return "", history, viewer_file
+
     messages = [{"role": "system", "content": INTRO_SYSTEM}]
     for msg in history:
         if msg["role"] in ("user", "assistant"):
@@ -586,9 +1013,11 @@ def chat_handler(user_message, history):
     bot_reply = res.choices[0].message.content
 
     stl_file = None
+    viewer_file = None
     if "All required parameters collected" in bot_reply:
         try:
             stl_file = run_pipeline(bot_reply)
+            viewer_file = prepare_viewer_model(stl_file) if stl_file else None
             bot_reply += "\n\n✅ **3D model generated!** Check the viewer →" if stl_file \
                          else "\n\n⚠️ Generation failed. Please try again."
         except Exception as e:
@@ -597,7 +1026,7 @@ def chat_handler(user_message, history):
 
     history.append({"role": "user",      "content": user_message})
     history.append({"role": "assistant", "content": bot_reply})
-    return "", history, stl_file
+    return "", history, viewer_file
 
 
 # ═══════════════════════════════════════════════════════════════════════════
