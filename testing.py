@@ -692,6 +692,85 @@ def make_cone(radius, height, stl_path):
     )
 
 
+def make_spring(mean_dia, wire_dia, free_length, pitch, stl_path):
+    """
+    Parametric helical spring (compression-style) using Helix + sweep.
+
+    Inputs are in mm:
+    - mean_dia: mean coil diameter
+    - wire_dia: wire diameter
+    - free_length: overall spring length
+    - pitch: axial distance per turn
+    """
+    # guard in the caller, but keep safe defaults here too
+    mean_r = max(float(mean_dia) / 2.0, 0.2)
+    wire_r = max(float(wire_dia) / 2.0, 0.1)
+    length = max(float(free_length), pitch * 1.0, wire_dia * 2.0, 0.5)
+    pitch = max(float(pitch), wire_dia * 0.6, 0.2)
+    helix_r = max(mean_r - wire_r, 0.2)
+    # Use the same proven Helix + sweep() call style as the thread generator,
+    # avoiding Helix parameter operators which can vary across build123d versions.
+    return (
+        "from build123d import *\n"
+        f"mean_dia = {float(mean_dia)}\n"
+        f"wire_dia = {float(wire_dia)}\n"
+        f"free_length = {float(free_length)}\n"
+        f"pitch = {float(pitch)}\n"
+        f"helix_r = {float(helix_r)}\n"
+        f"wire_r = {float(wire_r)}\n"
+        "with BuildPart() as b:\n"
+        "    helix = Helix(pitch=pitch, height=free_length, radius=helix_r)\n"
+        "    # IMPORTANT: place the wire profile at the helix radius (otherwise it collapses into a twisted rod)\n"
+        "    with BuildSketch(Plane.YZ.offset(helix_r)) as prof:\n"
+        "        Circle(radius=wire_r)\n"
+        "    sweep(sections=prof.face(), path=helix, multisection=False)\n"
+        f"export_stl(b.part, '{stl_path}')\n"
+    )
+
+
+def make_rivet(shank_dia, shank_len, head_dia, head_h, stl_path):
+    """
+    Simple mechanical rivet: cylindrical shank + button head cylinder.
+    All parameters in mm, dimension-driven.
+    """
+    shank_r = max(float(shank_dia) / 2.0, 0.1)
+    head_r = max(float(head_dia) / 2.0, shank_r * 1.05)
+    shank_len = max(float(shank_len), 0.2)
+    head_h = max(float(head_h), max(shank_dia * 0.25, 0.4))
+    # Reference-like rivet: hollow shank + flange head (tube), dimension-driven.
+    # Optional hole diameter can be provided via labeled "Hole Diameter"/"Inner Diameter"; otherwise inferred.
+    hole_d_guess = max(min(float(shank_dia) * 0.6, float(shank_dia) - 0.8), 0.5)
+    return (
+        "from build123d import *\n"
+        f"shank_dia = {float(shank_dia)}\n"
+        f"shank_len = {float(shank_len)}\n"
+        f"head_dia = {float(head_dia)}\n"
+        f"head_h = {float(head_h)}\n"
+        f"hole_d_guess = {float(hole_d_guess)}\n"
+        "with BuildPart() as b:\n"
+        "    shank_r = max(shank_dia / 2.0, 0.1)\n"
+        "    head_r = max(head_dia / 2.0, shank_r * 1.2)\n"
+        "    hole_d = hole_d_guess\n"
+        "    # If user supplied a hole/inner diameter in the summary text, prefer it.\n"
+        "    # (Summary text is not available inside this generated script; pipeline parses dims and passes them here.)\n"
+        "    hole_r = min(max(hole_d / 2.0, 0.1), shank_r * 0.92)\n"
+        "\n"
+        "    # Flange head\n"
+        "    with BuildSketch(Plane.XY):\n"
+        "        Circle(radius=head_r)\n"
+        "    extrude(amount=head_h)\n"
+        "\n"
+        "    # Hollow shank tube\n"
+        "    with BuildSketch(Plane.XY.offset(head_h)):\n"
+        "        Circle(radius=shank_r)\n"
+        "    extrude(amount=shank_len)\n"
+        "\n"
+        "    # Through bore\n"
+        "    Hole(radius=hole_r, depth=head_h + shank_len)\n"
+        f"export_stl(b.part, '{stl_path}')\n"
+    )
+
+
 def make_washer(inner_r, outer_r, thickness, stl_path):
     return make_circle_nut(inner_r, outer_r, thickness, stl_path)
 
@@ -836,6 +915,11 @@ def _requires_four_corners(summary: str) -> bool:
 
 def detect_object(summary: str) -> str:
     s = summary.lower()
+    # High-priority component keywords (must win even if prompt mentions screws/bolts/etc.)
+    if any(w in s for w in ["spring", "coil spring", "compression spring", "extension spring", "helical spring", "coil"]):
+        return "spring"
+    if any(w in s for w in ["rivet", "pop rivet", "blind rivet", "solid rivet"]):
+        return "rivet"
     if _has_corner_feature_request(s):
         return "plate"
     if any(w in s for w in ["screw", "machine screw", "wood screw", "self-tapping"]):
@@ -1222,6 +1306,72 @@ def generate_fallback(summary: str, stl_path: str) -> str:
     elif obj == "frame":
         code = generate_frame(summary, safe_path)
 
+    elif obj == "spring":
+        # Preferred prompt: outer or mean coil diameter + wire diameter + free length + pitch (or turns).
+        # If OD is provided, mean diameter is inferred as OD - wire_dia.
+        od_in = _extract_labeled_value(summary, [r"Outer\s*Dia(?:meter)?", r"OD"])
+        mean_dia_in = _extract_labeled_value(summary, [r"Mean\s*Dia(?:meter)?", r"Coil\s*Dia(?:meter)?", r"Mean\s*Diameter"])
+        wire_dia_in = _extract_labeled_value(summary, [r"Wire\s*Dia(?:meter)?", r"Wire", r"Wire\s*Thickness"])
+        free_len_in = _extract_labeled_value(summary, [r"Free\s*Length", r"Length", r"Height"])
+        pitch_in = _extract_labeled_value(summary, [r"Pitch"])
+        turns_in = _extract_labeled_value(summary, [r"Turns", r"Coils"])
+
+        # fallbacks to raw dims list
+        if wire_dia_in is None:
+            wire_dia_in = dims[1] if len(dims) >= 2 else 1.0
+        wire_dia = max(float(wire_dia_in or 1.0), 0.2)
+
+        if mean_dia_in is None:
+            if od_in is None and dims:
+                # common case: user provides OD as first number
+                od_in = dims[0]
+            if od_in is not None:
+                mean_dia_in = float(od_in) - wire_dia
+            elif dims:
+                mean_dia_in = dims[0]
+        if wire_dia_in is None:
+            wire_dia_in = dims[1] if len(dims) >= 2 else 1.0
+        if free_len_in is None:
+            free_len_in = dims[2] if len(dims) >= 3 else 20.0
+        mean_dia = max(float(mean_dia_in or 12.0), wire_dia * 1.2, 0.5)
+        free_length = max(float(free_len_in or 20.0), wire_dia * 2.0, 1.0)
+
+        # If turns provided, derive pitch. Else use pitch or derive from dims[3] or default.
+        if turns_in is not None and turns_in > 0:
+            pitch = free_length / max(float(turns_in), 1.0)
+        else:
+            if pitch_in is None and len(dims) >= 4:
+                pitch_in = dims[3]
+            pitch = float(pitch_in or max(wire_dia * 1.2, 2.0))
+
+        # Clamp pitch to avoid self-intersection.
+        pitch = max(pitch, wire_dia * 1.05)
+        code = make_spring(mean_dia, wire_dia, free_length, pitch, safe_path)
+
+    elif obj == "rivet":
+        # Prompt supports labeled inputs or plain numbers:
+        # - Rivet shank dia, shank length, head dia, head height.
+        shank_d = _extract_labeled_value(summary, [r"Shank\s*Dia(?:meter)?", r"Body\s*Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"])
+        shank_l = _extract_labeled_value(summary, [r"Shank\s*Length", r"Grip\s*Length", r"Length"])
+        head_d = _extract_labeled_value(summary, [r"Head\s*Dia(?:meter)?"])
+        head_h = _extract_labeled_value(summary, [r"Head\s*Height", r"Head\s*Thickness"])
+
+        # numeric fallbacks
+        if shank_d is None and dims:
+            shank_d = dims[0]
+        if shank_l is None:
+            shank_l = dims[1] if len(dims) >= 2 else 10.0
+        if head_d is None:
+            head_d = dims[2] if len(dims) >= 3 else max(float(shank_d or 4.0) * 1.8, 6.0)
+        if head_h is None:
+            head_h = dims[3] if len(dims) >= 4 else max(float(shank_d or 4.0) * 0.35, 1.5)
+
+        shank_d = max(float(shank_d or 4.0), 0.5)
+        shank_l = max(float(shank_l or 10.0), 0.5)
+        head_d = max(float(head_d), shank_d * 1.1)
+        head_h = max(float(head_h), 0.5)
+        code = make_rivet(shank_d, shank_l, head_d, head_h, safe_path)
+
     elif obj == "cone":
         # Accept prompts like:
         # - "cone radius 6mm height 20mm"
@@ -1365,6 +1515,75 @@ def build_direct_summary(user_message: str) -> str | None:
             "Now the design process will be started."
         )
 
+    if obj == "spring":
+        # Prefer labeled input; fall back to numeric dims:
+        # [mean_dia(or OD), wire_dia, free_length, pitch]
+        od_in = _extract_labeled_value(text, [r"Outer\s*Dia(?:meter)?", r"OD"])
+        mean_dia_in = _extract_labeled_value(text, [r"Mean\s*Dia(?:meter)?", r"Coil\s*Dia(?:meter)?", r"Mean\s*Diameter"])
+        wire_dia_in = _extract_labeled_value(text, [r"Wire\s*Dia(?:meter)?", r"Wire"])
+        free_len_in = _extract_labeled_value(text, [r"Free\s*Length", r"Length", r"Height"])
+        pitch_in = _extract_labeled_value(text, [r"Pitch"])
+        turns_in = _extract_labeled_value(text, [r"Turns", r"Coils"])
+
+        if wire_dia_in is None:
+            wire_dia_in = dims[1] if len(dims) >= 2 else None
+        wire_dia = float(wire_dia_in or 1.0)
+        wire_dia = max(wire_dia, 0.2)
+
+        if free_len_in is None:
+            free_len_in = dims[2] if len(dims) >= 3 else None
+        free_length = float(free_len_in or 30.0)
+        free_length = max(free_length, wire_dia * 2.0, 1.0)
+
+        # Determine mean diameter:
+        if mean_dia_in is None:
+            if od_in is None and dims:
+                # If user gave 12 1.2 30 ... interpret first number as OD (more common for users)
+                od_in = dims[0]
+            if od_in is not None:
+                mean_dia_in = float(od_in) - wire_dia
+        mean_dia = float(mean_dia_in or 12.0)
+        mean_dia = max(mean_dia, wire_dia * 1.2, 0.5)
+
+        if turns_in is not None and float(turns_in) > 0:
+            pitch = free_length / max(float(turns_in), 1.0)
+        else:
+            if pitch_in is None and len(dims) >= 4:
+                pitch_in = dims[3]
+            pitch = float(pitch_in or max(wire_dia * 1.4, 3.0))
+        pitch = max(pitch, wire_dia * 1.05)
+
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            f"- Object: Spring\n"
+            f"- Dimensions: Mean Dia={mean_dia:.3g}mm, Wire Dia={wire_dia:.3g}mm, Free Length={free_length:.3g}mm, Pitch={pitch:.3g}mm\n"
+            f"- Shape: Helical Coil\n"
+            f"- Features: None\n"
+            "Now the design process will be started."
+        )
+
+    if obj == "rivet":
+        shank_d = _extract_labeled_value(text, [r"Shank\s*Dia(?:meter)?", r"Body\s*Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"]) or (dims[0] if len(dims) >= 1 else None)
+        shank_l = _extract_labeled_value(text, [r"Shank\s*Length", r"Grip\s*Length", r"Length"]) or (dims[1] if len(dims) >= 2 else None)
+        head_d = _extract_labeled_value(text, [r"Head\s*Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else None)
+        head_h = _extract_labeled_value(text, [r"Head\s*Height", r"Head\s*Thickness"]) or (dims[3] if len(dims) >= 4 else None)
+
+        shank_d = max(float(shank_d or 4.0), 0.5)
+        shank_l = max(float(shank_l or 12.0), 0.5)
+        head_d = max(float(head_d or (shank_d * 2.0)), shank_d * 1.2)
+        head_h = max(float(head_h or max(shank_d * 0.35, 1.5)), 0.5)
+
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            f"- Object: Rivet\n"
+            f"- Dimensions: Shank Dia={shank_d:.3g}mm, Shank Length={shank_l:.3g}mm, Head Dia={head_d:.3g}mm, Head Height={head_h:.3g}mm\n"
+            f"- Shape: Button Head\n"
+            f"- Features: None\n"
+            "Now the design process will be started."
+        )
+
     return None
 
 
@@ -1372,6 +1591,11 @@ def should_use_deterministic_pipeline(summary: str) -> bool:
     obj = detect_object(summary)
     if obj == "unknown":
         return False
+
+    # Always use deterministic generators for these primitives/components.
+    # They are fully parametric and should not go through the LLM validator loop.
+    if obj in {"spring", "rivet", "cone"}:
+        return True
 
     s = summary.lower()
     cls = classify_object(summary)
@@ -1394,7 +1618,7 @@ def should_use_deterministic_pipeline(summary: str) -> bool:
     if any(keyword in s for keyword in complex_keywords):
         return False
 
-    return obj in {"box", "cylinder", "plate", "bracket", "washer", "bushing", "shaft"}
+    return obj in {"box", "cylinder", "plate", "bracket", "washer", "bushing", "shaft", "spring", "rivet", "cone"}
 
 
 def _cache_key(*parts: str) -> str:
@@ -1656,6 +1880,7 @@ def validate(summary: str, code: str) -> str:
     s = (summary or "").lower()
     code_text = code or ""
     code_lower = code_text.lower()
+    obj = detect_object(summary or "")
 
     if len(code_text.strip()) < CODE_MIN_LENGTH:
         return "invalid_output_too_short"
@@ -1672,7 +1897,10 @@ def validate(summary: str, code: str) -> str:
     if needs_hole and "hole(" not in code_lower:
         return "missing_hole"
 
-    needs_thread = any(keyword in s for keyword in ("thread", "threaded", "screw", "bolt", "nut", "stud"))
+    # Do not enforce thread constraints for springs/rivets; they can mention coils/wire/pitch.
+    needs_thread = (obj not in {"spring", "rivet"}) and any(
+        keyword in s for keyword in ("thread", "threaded", "screw", "bolt", "nut", "stud")
+    )
     if needs_thread:
         if "helix(" not in code_lower and "sweep(" not in code_lower:
             return "missing_thread_feature"
@@ -1688,7 +1916,13 @@ def validate(summary: str, code: str) -> str:
     if "gear" in s and "polarlocations" not in code_lower:
         return "missing_gear_pattern"
 
-    if any(k in s for k in ("holes", "pattern", "grid", "bolt circle", "multi-hole", "multiple holes")):
+    # Hole-pattern validation should only trigger for explicit hole-pattern requests.
+    # Some non-hole summaries (e.g. springs) may contain generic words like "pattern".
+    hole_pattern_requested = bool(
+        re.search(r"\b(?:holes|hole\s+pattern|bolt\s+circle|multi-hole|multiple\s+holes)\b", s)
+        or ("grid" in s and "hole" in s)
+    )
+    if hole_pattern_requested:
         if "gridlocations" not in code_lower and "polarlocations" not in code_lower:
             return "missing_hole_pattern"
 
@@ -1973,7 +2207,9 @@ def run_pipeline(summary: str):
     normalized_summary = " ".join(summary.strip().split())
     cache_id = _cache_key("pipeline", normalized_summary.lower())
     cached_path = _PIPELINE_CACHE.get(cache_id)
-    if cached_path and os.path.exists(cached_path):
+    # For spring/rivet, always regenerate to avoid stale geometry or viewer confusion.
+    detected_for_cache = detect_object(normalized_summary)
+    if detected_for_cache not in {"spring", "rivet"} and cached_path and os.path.exists(cached_path):
         if VERBOSE_LOGS:
             print(f"[MECHAI] Cache hit - {cached_path}")
         return cached_path
@@ -1982,6 +2218,57 @@ def run_pipeline(summary: str):
 
     detected_obj = detect_object(summary)
     classified_obj = classify_object(summary)
+
+    # ── HARD ROUTE: SPRING (no LLM, no fallback) ─────────────────────────────
+    if detected_obj == "spring":
+        lowered = normalized_summary.lower()
+        dims = parse_dims(normalized_summary)
+
+        # Parameter extraction rules (as specified):
+        # mean_dia = first number OR default 20
+        # wire_dia = second number OR default 2
+        # length   = third number OR default 50
+        # pitch    = fourth number OR default (wire_dia * 1.5)
+        mean_dia = dims[0] if len(dims) >= 1 else 20.0
+
+        if len(dims) >= 4:
+            wire_dia = dims[1]
+            length = dims[2]
+            pitch = dims[3]
+        elif len(dims) == 3:
+            wire_dia = dims[1]
+            length = dims[2]
+            pitch = float(wire_dia) * 1.5
+        elif len(dims) == 2:
+            # If only 2 values: assume mean_dia, length
+            mean_dia = dims[0]
+            length = dims[1]
+            wire_dia = float(mean_dia) * 0.1
+            pitch = float(wire_dia) * 1.5
+        else:
+            wire_dia = 2.0
+            length = 50.0
+            pitch = float(wire_dia) * 1.5
+
+        # If user gives "outer diameter": mean_dia = outer_dia - wire_dia
+        outer_dia = _extract_labeled_value(normalized_summary, [r"Outer\s*Dia(?:meter)?", r"OD"])
+        if outer_dia is not None:
+            mean_dia = float(outer_dia) - float(wire_dia)
+
+        # Safety limits
+        mean_dia = max(float(mean_dia), 2.0)
+        wire_dia = max(float(wire_dia), 0.5)
+        length = max(float(length), wire_dia * 3.0)
+        pitch = max(float(pitch), wire_dia * 1.05)
+
+        # prevent impossible geometry
+        mean_dia = max(mean_dia, wire_dia * 1.2)
+
+        code = make_spring(mean_dia, wire_dia, length, pitch, STL_PATH.replace("\\", "/"))
+        path = execute_code(code, STL_PATH, normalized_summary)
+        _PIPELINE_CACHE[cache_id] = path
+        print(f"[Deterministic-Spring] SUCCESS - {path}")
+        return path
 
     if should_use_deterministic_pipeline(summary):
         print("[MECHAI] Using deterministic simple-shape pipeline.")
