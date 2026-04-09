@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import math
 import json
+import pickle
+import pandas as pd
 
 # ── Ollama client ──────────────────────────────────────────────────────────
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
@@ -431,8 +433,8 @@ class AIExplainer:
         lines.append(f"|--------|-------|--------|")
         lines.append(f"| Stress | {result.stress_mpa:.2f} MPa | {self._stress_status(result)} |")
         lines.append(f"| Safety Factor | {result.safety_factor:.2f} | {self._sf_status(result)} |")
-        lines.append(f"| Deformation | {result.deformation_mm:.4f} mm | Elastic |")
-        lines.append(f"| Mass | {result.mass_g:.2f} g | - |")
+        lines.append(f"| Strain | {result.deformation_mm:.6f} | Elastic |")
+        lines.append(f"| Yield Point | {result.mass_g:.2f} MPa | Reference |")
         lines.append("")
         lines.append("### 🔍 Stress Concentration Analysis")
         lines.append(self.explain_stress(result.object_type))
@@ -497,39 +499,349 @@ def create_deform_plot(history: List[Dict]) -> go.Figure:
         deforms = [h["deform"] for h in history]
         fig.add_trace(go.Scatter(x=loads, y=deforms, mode='lines+markers', fill='tozeroy',
                                  fillcolor='rgba(59,130,246,0.2)', line=dict(color='#3b82f6', width=3)))
-    fig.update_layout(template="plotly_dark", title="Load vs Deformation",
-                      xaxis_title="Load (N)", yaxis_title="Deformation (mm)", height=300,
+    fig.update_layout(template="plotly_dark", title="Load vs Strain",
+                      xaxis_title="Load (N)", yaxis_title="Strain", height=300,
                       paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
     return fig
 
 
 def create_heatmap(result: SimResult, obj_type: str) -> go.Figure:
-    if obj_type in ["nut", "washer"]:
-        theta = np.linspace(0, 2*np.pi, 40)
-        r = np.linspace(5, 10, 20)
-        theta, r = np.meshgrid(theta, r)
-        x, y = r * np.cos(theta), r * np.sin(theta)
-        z = np.zeros_like(x)
-        stress = (10 - r) / 5 * result.stress_ratio
-    elif obj_type in ["bolt", "screw"]:
-        z = np.linspace(0, 30, 30)
-        theta = np.linspace(0, 2*np.pi, 30)
-        z, theta = np.meshgrid(z, theta)
-        x, y = 5 * np.cos(theta), 5 * np.sin(theta)
-        stress = np.where(z < 10, result.stress_ratio * 1.2, result.stress_ratio * 0.6)
-    else:
-        x = np.linspace(-10, 10, 30)
-        y = np.linspace(-10, 10, 30)
-        x, y = np.meshgrid(x, y)
-        z = np.zeros_like(x)
-        stress = result.stress_ratio * np.exp(-(x**2 + y**2)/100)
+    obj = str(obj_type).strip().lower()
+    ratio = float(max(0.01, result.stress_ratio))
+    colors = [[0, '#0088ff'], [0.25, '#00ddcc'], [0.5, '#00ff66'], [0.75, '#ffcc00'], [1, '#ff2222']]
+    cmax = 1.0
+    fig = go.Figure()
 
-    fig = go.Figure(data=[go.Surface(
-        x=x, y=y, z=z, surfacecolor=stress,
-        colorscale=[[0, '#0088ff'], [0.25, '#00ddcc'], [0.5, '#00ff66'],
-                    [0.75, '#ffcc00'], [1, '#ff2222']],
-        colorbar=dict(title='Stress/Yield', thickness=15)
-    )])
+    def _normalize_stress(s):
+        arr = np.array(s, dtype=float)
+        finite = np.isfinite(arr)
+        if not np.any(finite):
+            return arr
+        smin = np.nanmin(arr[finite])
+        smax = np.nanmax(arr[finite])
+        if abs(smax - smin) < 1e-9:
+            arr[finite] = 0.35
+            return arr
+        arr[finite] = (arr[finite] - smin) / (smax - smin)
+        return np.clip(arr, 0.0, 1.0)
+
+    def _add_surface(x, y, z, s, showscale=False):
+        s = _normalize_stress(s)
+        surface_kwargs = dict(
+            x=x, y=y, z=z, surfacecolor=s,
+            colorscale=colors, cmin=0.0, cmax=cmax,
+            showscale=showscale,
+            hovertemplate="x=%{x:.1f}<br>y=%{y:.1f}<br>z=%{z:.1f}<br>Stress/Yield=%{surfacecolor:.3f}<extra></extra>",
+        )
+        if showscale:
+            surface_kwargs["colorbar"] = dict(title='Stress/Yield', thickness=15)
+        fig.add_trace(go.Surface(**surface_kwargs))
+
+    def _cyl_shell(radius=8.0, length=26.0, z0=0.0, n_theta=84, n_z=42, amp=None):
+        theta = np.linspace(0, 2 * np.pi, n_theta)
+        z = np.linspace(z0, z0 + length, n_z)
+        theta, z = np.meshgrid(theta, z)
+        r = radius if amp is None else (radius + amp(theta, z))
+        x = r * np.cos(theta)
+        y = r * np.sin(theta)
+        return x, y, z, theta
+
+    def _disc(radius=8.0, z0=0.0, n_theta=96, n_r=34):
+        theta = np.linspace(0, 2 * np.pi, n_theta)
+        r = np.linspace(0.0, radius, n_r)
+        theta, r = np.meshgrid(theta, r)
+        x = r * np.cos(theta)
+        y = r * np.sin(theta)
+        z = np.full_like(x, z0)
+        return x, y, z, r
+
+    def _ring_disc(r_in=4.0, r_out=10.0, z0=0.0, n_theta=96, n_r=32):
+        theta = np.linspace(0, 2 * np.pi, n_theta)
+        r = np.linspace(r_in, r_out, n_r)
+        theta, r = np.meshgrid(theta, r)
+        x = r * np.cos(theta)
+        y = r * np.sin(theta)
+        z = np.full_like(x, z0)
+        return x, y, z, r, theta
+
+    def _add_cylinder(radius, length, hotspot=0.65, z0=0.0, threaded=False):
+        x, y, z, theta = _cyl_shell(radius=radius, length=length, z0=z0, amp=(lambda t, zz: 0.45 * np.sin(6.0 * t + 0.9 * zz)) if threaded else None)
+        axial = z / max(1e-6, z0 + length)
+        s_shell = ratio * (0.20 + 0.55 * axial + 0.35 * np.exp(-((axial - hotspot) ** 2) / 0.02))
+        if threaded:
+            s_shell *= (1.0 + 0.18 * np.sin(6.0 * theta + 0.9 * z))
+        _add_surface(x, y, z, s_shell, showscale=True)
+        x1, y1, z1, r1 = _disc(radius, z0=z0)
+        s1 = ratio * (0.15 + 0.40 * (r1 / radius))
+        _add_surface(x1, y1, z1, s1)
+        x2, y2, z2, r2 = _disc(radius, z0=z0 + length)
+        s2 = ratio * (0.30 + 0.50 * (r2 / radius))
+        _add_surface(x2, y2, z2, s2)
+
+    try:
+        if obj in ["cylinder", "shaft", "bushing", "coupling"]:
+            _add_cylinder(radius=8.0, length=28.0, hotspot=0.7)
+        elif obj in ["bolt", "rivet"]:
+            _add_cylinder(radius=4.2, length=28.0, hotspot=0.2 if obj == "rivet" else 0.35)
+            _add_cylinder(radius=8.0, length=6.0, hotspot=0.5, z0=28.0)  # head
+        elif obj == "screw":
+            _add_cylinder(radius=3.8, length=30.0, hotspot=0.35, threaded=True)
+            _add_cylinder(radius=6.8, length=5.0, hotspot=0.5, z0=30.0)  # head
+        elif obj == "nut":
+            # Hex nut: outer hex prism + inner cylindrical bore + top/bottom annular faces.
+            r_in, r_out, h = 4.5, 10.0, 6.5
+
+            def _hex_radius(theta_vals, flat_radius):
+                # Polar radius of regular hexagon with flats at 0, 60, ...
+                a = (theta_vals + np.pi / 6) % (np.pi / 3) - np.pi / 6
+                return flat_radius * np.cos(np.pi / 6) / np.maximum(np.cos(a), 1e-6)
+
+            theta = np.linspace(0, 2 * np.pi, 180)
+            zz = np.linspace(0.0, h, 40)
+            theta, zz = np.meshgrid(theta, zz)
+            r_hex = _hex_radius(theta, r_out)
+            xh = r_hex * np.cos(theta)
+            yh = r_hex * np.sin(theta)
+            zh = zz
+
+            corner_hotspot = np.clip(np.cos(3 * theta) ** 8, 0.0, 1.0)
+            axial = zz / h
+            s_outer = ratio * (0.22 + 0.55 * corner_hotspot + 0.18 * axial)
+            _add_surface(xh, yh, zh, s_outer, showscale=True)
+
+            xi, yi, zi, _ = _cyl_shell(radius=r_in, length=h, z0=0.0)
+            # Higher stress around bore where threads/load transfer happen.
+            s_inner = ratio * (0.55 + 0.35 * np.exp(-((zi / h - 0.5) ** 2) / 0.08))
+            _add_surface(xi, yi, zi, s_inner)
+
+            rt = np.linspace(0.0, 1.0, 46)
+            tt = np.linspace(0, 2 * np.pi, 180)
+            rt, tt = np.meshgrid(rt, tt)
+            rhex_top = _hex_radius(tt, r_out)
+            rr = r_in + (rhex_top - r_in) * rt
+            xt = rr * np.cos(tt)
+            yt = rr * np.sin(tt)
+            zt = np.full_like(xt, h)
+            radial_top = (rr - r_in) / np.maximum(rhex_top - r_in, 1e-6)
+            s_top = ratio * (0.35 + 0.60 * (1.0 - radial_top))  # redder near bore
+            _add_surface(xt, yt, zt, s_top)
+
+            xb = rr * np.cos(tt)
+            yb = rr * np.sin(tt)
+            zb = np.full_like(xb, 0.0)
+            s_bot = ratio * (0.28 + 0.45 * (1.0 - radial_top))
+            _add_surface(xb, yb, zb, s_bot)
+        elif obj in ["washer", "bearing", "pulley", "sprocket", "gear"]:
+            # Dedicated geometries so pulley/bearing always render and gear looks like spur gear.
+            if obj == "washer":
+                r_in, r_out, h = 5.5, 11.0, 2.4
+                x, y, z, _ = _cyl_shell(radius=r_out, length=h, z0=0.0)
+                _add_surface(x, y, z, ratio * (0.22 + 0.55 * (z / h)), showscale=True)
+                xi, yi, zi, _ = _cyl_shell(radius=r_in, length=h, z0=0.0)
+                _add_surface(xi, yi, zi, ratio * (0.65 - 0.20 * (zi / h)))
+                xt, yt, zt, rt, _ = _ring_disc(r_in, r_out, z0=h)
+                _add_surface(xt, yt, zt, ratio * (0.25 + 0.65 * ((r_out - rt) / (r_out - r_in))))
+                xb, yb, zb, rb, _ = _ring_disc(r_in, r_out, z0=0.0)
+                _add_surface(xb, yb, zb, ratio * (0.18 + 0.45 * (rb / r_out)))
+
+            elif obj == "bearing":
+                # Outer race, inner race and raceway groove profile.
+                r_bore, r_inner, r_outer, h = 4.5, 8.0, 13.0, 7.0
+                xo, yo, zo, _ = _cyl_shell(radius=r_outer, length=h, z0=0.0)
+                _add_surface(xo, yo, zo, ratio * (0.25 + 0.55 * np.exp(-((zo / h - 0.5) ** 2) / 0.04)), showscale=True)
+                xi, yi, zi, _ = _cyl_shell(radius=r_inner, length=h, z0=0.0)
+                _add_surface(xi, yi, zi, ratio * (0.30 + 0.45 * np.exp(-((zi / h - 0.5) ** 2) / 0.03)))
+                xb, yb, zb, _ = _cyl_shell(radius=r_bore, length=h, z0=0.0)
+                _add_surface(xb, yb, zb, ratio * (0.65 - 0.20 * (zb / h)))
+                xt, yt, zt, rt, _ = _ring_disc(r_bore, r_outer, z0=h)
+                race = np.exp(-((rt - r_inner) ** 2) / 1.2)
+                _add_surface(xt, yt, zt, ratio * (0.20 + 0.65 * race))
+                xbb, ybb, zbb, rb, _ = _ring_disc(r_bore, r_outer, z0=0.0)
+                race_b = np.exp(-((rb - r_inner) ** 2) / 1.2)
+                _add_surface(xbb, ybb, zbb, ratio * (0.18 + 0.55 * race_b))
+
+            elif obj == "pulley":
+                # Hub + rim + central groove.
+                r_bore, r_hub, r_rim, h = 4.5, 7.0, 13.5, 8.0
+                xh, yh, zh, _ = _cyl_shell(radius=r_hub, length=h, z0=0.0)
+                _add_surface(xh, yh, zh, ratio * (0.28 + 0.40 * (zh / h)), showscale=True)
+                xr, yr, zr, theta = _cyl_shell(radius=r_rim, length=h, z0=0.0, amp=lambda t, zz: -0.9 * np.exp(-((zz / h - 0.5) ** 2) / 0.03))
+                rim_hot = 0.35 + 0.45 * np.exp(-((zr / h - 0.5) ** 2) / 0.03) + 0.15 * np.cos(theta) ** 2
+                _add_surface(xr, yr, zr, ratio * rim_hot)
+                xb, yb, zb, _ = _cyl_shell(radius=r_bore, length=h, z0=0.0)
+                _add_surface(xb, yb, zb, ratio * (0.62 - 0.15 * (zb / h)))
+                xt, yt, zt, rt, _ = _ring_disc(r_bore, r_rim, z0=h)
+                _add_surface(xt, yt, zt, ratio * (0.2 + 0.6 * ((r_rim - rt) / (r_rim - r_bore))))
+                xb2, yb2, zb2, rb, _ = _ring_disc(r_bore, r_rim, z0=0.0)
+                _add_surface(xb2, yb2, zb2, ratio * (0.2 + 0.45 * (rb / r_rim)))
+
+            elif obj in ["gear", "sprocket"]:
+                if obj == "gear":
+                    # Reference-style spur gear: solid center, blocky teeth, flat top face.
+                    teeth = 20
+                    r_core, r_root, r_tip, h = 7.2, 10.0, 12.6, 6.8
+
+                    def _gear_tooth_radius(t):
+                        c = np.cos(teeth * t)
+                        tooth_sector = (c > 0.45).astype(float)
+                        chamfer = np.clip((c - 0.35) / 0.10, 0.0, 1.0) * np.clip((0.55 - c) / 0.10, 0.0, 1.0)
+                        return r_root + (r_tip - r_root) * np.clip(tooth_sector + 0.25 * chamfer, 0.0, 1.0)
+
+                    tt = np.linspace(0, 2 * np.pi, 320)
+                    zz = np.linspace(0.0, h, 42)
+                    tt, zz = np.meshgrid(tt, zz)
+                    rbnd = _gear_tooth_radius(tt)
+                    xg = rbnd * np.cos(tt)
+                    yg = rbnd * np.sin(tt)
+                    zg = zz
+                    tooth_hot = (rbnd - r_root) / max(1e-6, (r_tip - r_root))
+                    s_outer = ratio * (0.20 + 0.62 * tooth_hot + 0.12 * np.exp(-((zz / h - 0.55) ** 2) / 0.08))
+                    _add_surface(xg, yg, zg, s_outer, showscale=True)
+
+                    xc, yc, zc, _ = _cyl_shell(radius=r_core, length=h, z0=0.0)
+                    s_core = ratio * (0.18 + 0.20 * (zc / h))
+                    _add_surface(xc, yc, zc, s_core)
+
+                    uu = np.linspace(0.0, 1.0, 92)
+                    t2 = np.linspace(0, 2 * np.pi, 320)
+                    uu, t2 = np.meshgrid(uu, t2)
+                    r_tooth = _gear_tooth_radius(t2)
+                    rr = r_core + (r_tooth - r_core) * uu
+                    xt = rr * np.cos(t2)
+                    yt = rr * np.sin(t2)
+                    rim_ratio = (rr - r_core) / np.maximum(r_tooth - r_core, 1e-6)
+
+                    zt = np.full_like(xt, h)
+                    s_top = ratio * (0.22 + 0.55 * (1.0 - rim_ratio) + 0.15 * np.clip(np.cos(teeth * t2), 0.0, 1.0))
+                    _add_surface(xt, yt, zt, s_top)
+
+                    zb = np.full_like(xt, 0.0)
+                    s_bot = ratio * (0.18 + 0.45 * rim_ratio)
+                    _add_surface(xt, yt, zb, s_bot)
+                else:
+                    # Keep sprocket distinct with fewer/larger teeth.
+                    teeth = 12
+                    r_bore, r_root, r_tip, h = 4.2, 9.8, 12.8, 6.5
+                    xg, yg, zg, theta = _cyl_shell(
+                        radius=r_root,
+                        length=h,
+                        z0=0.0,
+                        amp=lambda t, zz: (r_tip - r_root) * np.clip(np.cos(teeth * t), 0.0, 1.0) ** 1.6
+                    )
+                    tooth_peak = np.clip(np.cos(teeth * theta), 0.0, 1.0) ** 1.6
+                    _add_surface(xg, yg, zg, ratio * (0.24 + 0.62 * tooth_peak + 0.12 * (zg / h)), showscale=True)
+                    xbore, ybore, zbore, _ = _cyl_shell(radius=r_bore, length=h, z0=0.0)
+                    _add_surface(xbore, ybore, zbore, ratio * (0.68 - 0.20 * (zbore / h)))
+                    xcap, ycap, zcap, rcap, _ = _ring_disc(r_bore, r_tip, z0=h)
+                    _add_surface(xcap, ycap, zcap, ratio * (0.2 + 0.7 * ((r_tip - rcap) / (r_tip - r_bore))))
+                    xcap2, ycap2, zcap2, rcap2, _ = _ring_disc(r_bore, r_tip, z0=0.0)
+                    _add_surface(xcap2, ycap2, zcap2, ratio * (0.18 + 0.5 * (rcap2 / r_tip)))
+        elif obj == "spring":
+            t = np.linspace(0, 8 * np.pi, 220)
+            s = np.linspace(0, 2 * np.pi, 30)
+            t, s = np.meshgrid(t, s)
+            R, r = 7.0, 1.0
+            x = (R + r * np.cos(s)) * np.cos(t)
+            y = (R + r * np.cos(s)) * np.sin(t)
+            z = 1.7 * t + r * np.sin(s)
+            ss = ratio * (0.25 + 0.75 * np.abs(np.sin(t)))
+            _add_surface(x, y, z, ss, showscale=True)
+        elif obj == "hinge":
+            xx = np.linspace(-13, 13, 52)
+            yy = np.linspace(-8, 8, 34)
+            xx, yy = np.meshgrid(xx, yy)
+            z_left = np.full_like(xx, 0.0)
+            z_right = np.full_like(xx, 4.0)
+            s_left = ratio * (0.15 + 0.85 * np.exp(-((xx + 1.5) ** 2) / 4.0))
+            s_right = ratio * (0.15 + 0.85 * np.exp(-((xx - 1.5) ** 2) / 4.0))
+            mask_l = xx <= -1.0
+            mask_r = xx >= 1.0
+            _add_surface(np.where(mask_l, xx, np.nan), np.where(mask_l, yy, np.nan), np.where(mask_l, z_left, np.nan), np.where(mask_l, s_left, np.nan), showscale=True)
+            _add_surface(np.where(mask_r, xx, np.nan), np.where(mask_r, yy, np.nan), np.where(mask_r, z_right, np.nan), np.where(mask_r, s_right, np.nan))
+            _add_cylinder(radius=2.2, length=18.0, hotspot=0.5, z0=0.0)  # hinge pin
+        elif obj in ["cube", "box", "cuboid", "bracket", "cone", "sphere"]:
+            if obj == "sphere":
+                th = np.linspace(0, 2 * np.pi, 88)
+                ph = np.linspace(0.05, np.pi - 0.05, 50)
+                th, ph = np.meshgrid(th, ph)
+                r = 9.0
+                x = r * np.sin(ph) * np.cos(th)
+                y = r * np.sin(ph) * np.sin(th)
+                z = r * np.cos(ph)
+                s = ratio * (0.2 + 0.8 * (np.sin(ph) ** 2))
+                _add_surface(x, y, z, s, showscale=True)
+            elif obj == "cone":
+                z = np.linspace(0, 16, 58)
+                th = np.linspace(0, 2 * np.pi, 92)
+                z, th = np.meshgrid(z, th)
+                r = 9.0 * (1 - z / 16.0)
+                x = r * np.cos(th)
+                y = r * np.sin(th)
+                s = ratio * (0.25 + 0.75 * (z / 16.0))
+                _add_surface(x, y, z, s, showscale=True)
+                xb, yb, zb, rb = _disc(radius=9.0, z0=0.0)
+                _add_surface(xb, yb, zb, ratio * (0.2 + 0.5 * rb / 9.0))
+            elif obj == "bracket":
+                # L-bracket: base plate + vertical plate
+                x = np.linspace(-12, 12, 36)
+                y = np.linspace(-10, 10, 30)
+                x, y = np.meshgrid(x, y)
+                zb = np.full_like(x, 0.0)
+                sb = ratio * (0.20 + 0.35 * (np.abs(x) / 12.0) + 0.60 * np.exp(-((x + 9) ** 2 + (y - 2) ** 2) / 18.0))
+                _add_surface(x, y, zb, sb, showscale=True)
+
+                y2 = np.linspace(-10, 10, 30)
+                z2 = np.linspace(0, 14, 32)
+                y2, z2 = np.meshgrid(y2, z2)
+                x2 = np.full_like(y2, -10.0)
+                s2 = ratio * (0.25 + 0.55 * (z2 / 14.0) + 0.35 * np.exp(-((z2 - 2.5) ** 2 + (y2 - 2) ** 2) / 10.0))
+                _add_surface(x2, y2, z2, s2)
+            else:
+                # Box/cuboid body with side faces
+                lx, ly, lz = (16.0, 16.0, 16.0) if obj == "cube" else (22.0, 14.0, 10.0)
+                x = np.linspace(-lx / 2, lx / 2, 34)
+                y = np.linspace(-ly / 2, ly / 2, 28)
+                x, y = np.meshgrid(x, y)
+                zt = np.full_like(x, lz / 2)
+                zb = np.full_like(x, -lz / 2)
+                edge = (np.abs(x) / (lx / 2)) ** 3 + (np.abs(y) / (ly / 2)) ** 3
+                st = ratio * (0.18 + 0.82 * np.clip(edge / 2.0, 0.0, 1.0))
+                sb = ratio * (0.15 + 0.45 * np.clip(edge / 2.0, 0.0, 1.0))
+                _add_surface(x, y, zt, st, showscale=True)
+                _add_surface(x, y, zb, sb)
+
+                ys = np.linspace(-ly / 2, ly / 2, 28)
+                zs = np.linspace(-lz / 2, lz / 2, 28)
+                ys, zs = np.meshgrid(ys, zs)
+                xr = np.full_like(ys, lx / 2)
+                xl = np.full_like(ys, -lx / 2)
+                sr = ratio * (0.22 + 0.55 * np.abs(zs) / (lz / 2))
+                sl = ratio * (0.22 + 0.55 * np.abs(zs) / (lz / 2))
+                _add_surface(xr, ys, zs, sr)
+                _add_surface(xl, ys, zs, sl)
+
+                xs = np.linspace(-lx / 2, lx / 2, 34)
+                zs2 = np.linspace(-lz / 2, lz / 2, 28)
+                xs, zs2 = np.meshgrid(xs, zs2)
+                yf = np.full_like(xs, ly / 2)
+                yb = np.full_like(xs, -ly / 2)
+                sf = ratio * (0.24 + 0.50 * np.abs(zs2) / (lz / 2))
+                sbk = ratio * (0.24 + 0.50 * np.abs(zs2) / (lz / 2))
+                _add_surface(xs, yf, zs2, sf)
+                _add_surface(xs, yb, zs2, sbk)
+        else:
+            _add_cylinder(radius=7.0, length=20.0, hotspot=0.6)
+    except Exception:
+        # Never break simulation UI because of plotting; fallback to safe 3D cylinder heatmap.
+        fig = go.Figure()
+        x, y, z, theta = _cyl_shell(radius=7.0, length=22.0, z0=0.0)
+        s = ratio * (0.2 + 0.6 * (z / 22.0) + 0.2 * np.cos(theta) ** 2)
+        fig.add_trace(go.Surface(
+            x=x, y=y, z=z, surfacecolor=s,
+            colorscale=colors, cmin=0.0, cmax=cmax, showscale=True,
+            colorbar=dict(title='Stress/Yield', thickness=15),
+        ))
+
     fig.update_layout(
         template="plotly_dark", title="3D Stress Heatmap",
         scene=dict(aspectmode='data', xaxis_title='X (mm)', yaxis_title='Y (mm)', zaxis_title='Z (mm)'),
@@ -577,9 +889,62 @@ sim_state = SimAppState()
 sim_engine = SimulationEngine()
 ai_explainer = AIExplainer()
 
+# ML simulation models
+ML_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ML_models")
+_ml_models_cache = {}
+
+
+def _load_ml_model(model_file: str):
+    full_path = os.path.join(ML_MODELS_DIR, model_file)
+    if model_file not in _ml_models_cache:
+        with open(full_path, "rb") as f:
+            _ml_models_cache[model_file] = pickle.load(f)
+    return _ml_models_cache[model_file]
+
+
+def _predict_from_ml_models(load: float, temperature: float, component_type: str) -> Dict[str, float]:
+    model_map = {
+        "material": "Material_model.pkl",
+        "stress": "Stress_model.pkl",
+        "strain": "Strain_model.pkl",
+        "yield": "Yield_model.pkl",
+        "safety": "Safety_model.pkl",
+    }
+    x_input = pd.DataFrame([{
+        "load_n": float(load),
+        "temperature_c": float(temperature),
+        "component": str(component_type).strip().lower(),
+    }])
+
+    predictions = {}
+    for key, file_name in model_map.items():
+        preprocessor, model = _load_ml_model(file_name)
+        x_processed = preprocessor.transform(x_input)
+        predictions[key] = model.predict(x_processed)[0]
+
+    stress_mpa = float(predictions["stress"]) / 1_000_000.0
+    yield_mpa = max(1e-6, float(predictions["yield"]) / 1_000_000.0)
+    stress_ratio = max(0.0, stress_mpa / yield_mpa)
+    safety_factor = max(0.0, float(predictions["safety"]))
+    strain_value = max(0.0, float(predictions["strain"]))
+
+    material_raw = str(predictions["material"]).strip().lower()
+    material_key = material_raw if material_raw in MATERIALS else "steel"
+    material_label = MATERIALS[material_key]["label"]
+
+    return {
+        "material_key": material_key,
+        "material_label": material_label,
+        "stress_mpa": stress_mpa,
+        "strain": strain_value,
+        "yield_mpa": yield_mpa,
+        "safety_factor": safety_factor,
+        "stress_ratio": stress_ratio,
+    }
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  VERIFIED build123d CODE TEMPLATES (unchanged from modelling.py)
+#  VERIFIED build123d CODE TEMPLATES (from 1.txt — updated modelling)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def make_hex_nut(inner_r, outer_r, thickness, stl_path):
@@ -682,8 +1047,6 @@ def make_box(length, width, height, stl_path):
 
 
 def make_cone(radius, height, stl_path):
-    # Build123d has a Cone primitive in supported environments.
-    # We intentionally keep this simple (no fillets/holes) and dimension-driven.
     return (
         "from build123d import *\n"
         f"with BuildPart() as b:\n"
@@ -702,14 +1065,11 @@ def make_spring(mean_dia, wire_dia, free_length, pitch, stl_path):
     - free_length: overall spring length
     - pitch: axial distance per turn
     """
-    # guard in the caller, but keep safe defaults here too
     mean_r = max(float(mean_dia) / 2.0, 0.2)
     wire_r = max(float(wire_dia) / 2.0, 0.1)
     length = max(float(free_length), pitch * 1.0, wire_dia * 2.0, 0.5)
     pitch = max(float(pitch), wire_dia * 0.6, 0.2)
     helix_r = max(mean_r - wire_r, 0.2)
-    # Use the same proven Helix + sweep() call style as the thread generator,
-    # avoiding Helix parameter operators which can vary across build123d versions.
     return (
         "from build123d import *\n"
         f"mean_dia = {float(mean_dia)}\n"
@@ -720,7 +1080,6 @@ def make_spring(mean_dia, wire_dia, free_length, pitch, stl_path):
         f"wire_r = {float(wire_r)}\n"
         "with BuildPart() as b:\n"
         "    helix = Helix(pitch=pitch, height=free_length, radius=helix_r)\n"
-        "    # IMPORTANT: place the wire profile at the helix radius (otherwise it collapses into a twisted rod)\n"
         "    with BuildSketch(Plane.YZ.offset(helix_r)) as prof:\n"
         "        Circle(radius=wire_r)\n"
         "    sweep(sections=prof.face(), path=helix, multisection=False)\n"
@@ -737,8 +1096,6 @@ def make_rivet(shank_dia, shank_len, head_dia, head_h, stl_path):
     head_r = max(float(head_dia) / 2.0, shank_r * 1.05)
     shank_len = max(float(shank_len), 0.2)
     head_h = max(float(head_h), max(shank_dia * 0.25, 0.4))
-    # Reference-like rivet: hollow shank + flange head (tube), dimension-driven.
-    # Optional hole diameter can be provided via labeled "Hole Diameter"/"Inner Diameter"; otherwise inferred.
     hole_d_guess = max(min(float(shank_dia) * 0.6, float(shank_dia) - 0.8), 0.5)
     return (
         "from build123d import *\n"
@@ -751,8 +1108,6 @@ def make_rivet(shank_dia, shank_len, head_dia, head_h, stl_path):
         "    shank_r = max(shank_dia / 2.0, 0.1)\n"
         "    head_r = max(head_dia / 2.0, shank_r * 1.2)\n"
         "    hole_d = hole_d_guess\n"
-        "    # If user supplied a hole/inner diameter in the summary text, prefer it.\n"
-        "    # (Summary text is not available inside this generated script; pipeline parses dims and passes them here.)\n"
         "    hole_r = min(max(hole_d / 2.0, 0.1), shank_r * 0.92)\n"
         "\n"
         "    # Flange head\n"
@@ -900,56 +1255,6 @@ def make_pulley(outer_d, face_w, bore_d, stl_path, groove_d=None, hub_d=None, fl
     )
 
 
-def make_hardcoded_pulley(stl_path):
-    """
-    Fixed reference-style pulley:
-    - dual flanges
-    - reduced center groove section
-    - single-side hub boss
-    - through bore
-    """
-    return (
-        "from build123d import *\n"
-        "outer_d = 80.0\n"
-        "face_w = 28.0\n"
-        "bore_d = 20.0\n"
-        "groove_d = 56.0\n"
-        "hub_d = 34.0\n"
-        "flange_t = 8.0\n"
-        "hub_h = 10.0\n"
-        "with BuildPart() as b:\n"
-        "    outer_r = outer_d / 2.0\n"
-        "    groove_r = groove_d / 2.0\n"
-        "    hub_r = hub_d / 2.0\n"
-        "    bore_r = bore_d / 2.0\n"
-        "    mid_h = max(face_w - 2.0 * flange_t, 4.0)\n"
-        "\n"
-        "    # Bottom flange\n"
-        "    with BuildSketch(Plane.XY):\n"
-        "        Circle(radius=outer_r)\n"
-        "    extrude(amount=flange_t)\n"
-        "\n"
-        "    # Reduced middle section (belt groove profile)\n"
-        "    with BuildSketch(Plane.XY.offset(flange_t)):\n"
-        "        Circle(radius=groove_r)\n"
-        "    extrude(amount=mid_h)\n"
-        "\n"
-        "    # Top flange\n"
-        "    with BuildSketch(Plane.XY.offset(flange_t + mid_h)):\n"
-        "        Circle(radius=outer_r)\n"
-        "    extrude(amount=face_w - (flange_t + mid_h))\n"
-        "\n"
-        "    # Single-side hub boss (reference-like)\n"
-        "    with BuildSketch(Plane.XY.offset(face_w)):\n"
-        "        Circle(radius=hub_r)\n"
-        "    extrude(amount=hub_h)\n"
-        "\n"
-        "    # Through bore across full part + hub\n"
-        "    Hole(radius=bore_r, depth=face_w + hub_h)\n"
-        f"export_stl(b.part, '{stl_path}')\n"
-    )
-
-
 def make_hinge(leaf_l, leaf_w, leaf_t, pin_d, knuckle_d, stl_path, knuckle_count=5, hole_d=4.0, holes_per_leaf=3):
     """
     Parametric butt hinge:
@@ -1059,7 +1364,7 @@ def make_bracket(base_l, base_w, wall_h, thickness, stl_path):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  OBJECT DETECTOR (unchanged from modelling.py)
+#  OBJECT DETECTOR (updated from 1.txt — new types: spring, rivet, hinge, pulley, cone)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _has_corner_feature_request(summary: str) -> bool:
@@ -1377,10 +1682,10 @@ def generate_specialized_code(summary: str, stl_path: str) -> str | None:
 
 def generate_fallback(summary: str, stl_path: str) -> str:
     safe_path = stl_path.replace("\\", "/")
-    obj   = detect_object(summary)
-    dims  = parse_dims(summary)
+    obj     = detect_object(summary)
+    dims    = parse_dims(summary)
     lowered = summary.lower()
-    is_hex = "hex" in lowered
+    is_hex  = "hex" in lowered
 
     print(f"[Fallback] Object='{obj}'  Dims={dims}  Hex={is_hex}")
 
@@ -1452,42 +1757,40 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         code = make_bushing(inner_r, outer_r, height, safe_path)
 
     elif obj == "pulley":
-        od_in = _extract_labeled_value(summary, [r"Outer\s*Dia(?:meter)?", r"OD", r"Pulley\s*Dia(?:meter)?", r"Diameter"])
-        fw_in = _extract_labeled_value(summary, [r"Face\s*Width", r"Width", r"Thickness"])
-        bore_in = _extract_labeled_value(summary, [r"Bore\s*Dia(?:meter)?", r"Inner\s*Dia(?:meter)?", r"Shaft\s*Dia(?:meter)?"])
-        groove_in = _extract_labeled_value(summary, [r"Groove\s*Dia(?:meter)?"])
-        hub_in = _extract_labeled_value(summary, [r"Hub\s*Dia(?:meter)?"])
+        od_in       = _extract_labeled_value(summary, [r"Outer\s*Dia(?:meter)?", r"OD", r"Pulley\s*Dia(?:meter)?", r"Diameter"])
+        fw_in       = _extract_labeled_value(summary, [r"Face\s*Width", r"Width", r"Thickness"])
+        bore_in     = _extract_labeled_value(summary, [r"Bore\s*Dia(?:meter)?", r"Inner\s*Dia(?:meter)?", r"Shaft\s*Dia(?:meter)?"])
+        groove_in   = _extract_labeled_value(summary, [r"Groove\s*Dia(?:meter)?"])
+        hub_in      = _extract_labeled_value(summary, [r"Hub\s*Dia(?:meter)?"])
         flange_t_in = _extract_labeled_value(summary, [r"Flange\s*Thickness", r"Rim\s*Thickness"])
 
-        outer_d = float(od_in if od_in is not None else (dims[0] if len(dims) >= 1 else 80.0))
-        face_w = float(fw_in if fw_in is not None else (dims[1] if len(dims) >= 2 else max(outer_d * 0.35, 24.0)))
-        bore_d = float(bore_in if bore_in is not None else (dims[2] if len(dims) >= 3 else max(outer_d * 0.25, 12.0)))
-        groove_d = float(groove_in if groove_in is not None else (dims[3] if len(dims) >= 4 else outer_d * 0.82))
-        hub_d = float(hub_in if hub_in is not None else (dims[4] if len(dims) >= 5 else outer_d * 0.42))
+        outer_d  = float(od_in       if od_in       is not None else (dims[0] if len(dims) >= 1 else 80.0))
+        face_w   = float(fw_in       if fw_in       is not None else (dims[1] if len(dims) >= 2 else max(outer_d * 0.35, 24.0)))
+        bore_d   = float(bore_in     if bore_in     is not None else (dims[2] if len(dims) >= 3 else max(outer_d * 0.25, 12.0)))
+        groove_d = float(groove_in   if groove_in   is not None else (dims[3] if len(dims) >= 4 else outer_d * 0.82))
+        hub_d    = float(hub_in      if hub_in      is not None else (dims[4] if len(dims) >= 5 else outer_d * 0.42))
         flange_t = float(flange_t_in if flange_t_in is not None else (dims[5] if len(dims) >= 6 else face_w * 0.30))
 
         code = make_pulley(outer_d, face_w, bore_d, safe_path, groove_d, hub_d, flange_t)
 
     elif obj == "hinge":
-        # Order (numeric fallback): leaf length, leaf width, leaf thickness,
-        # pin dia, knuckle dia, knuckle count, hole dia, holes per leaf
-        leaf_l_in = _extract_labeled_value(summary, [r"Leaf\s*Length", r"Length", r"L\b"])
-        leaf_w_in = _extract_labeled_value(summary, [r"Leaf\s*Width", r"Width", r"W\b"])
-        leaf_t_in = _extract_labeled_value(summary, [r"Leaf\s*Thickness", r"Thickness", r"T\b"])
-        pin_d_in = _extract_labeled_value(summary, [r"Pin\s*Dia(?:meter)?", r"Pin"])
+        leaf_l_in    = _extract_labeled_value(summary, [r"Leaf\s*Length", r"Length", r"L\b"])
+        leaf_w_in    = _extract_labeled_value(summary, [r"Leaf\s*Width", r"Width", r"W\b"])
+        leaf_t_in    = _extract_labeled_value(summary, [r"Leaf\s*Thickness", r"Thickness", r"T\b"])
+        pin_d_in     = _extract_labeled_value(summary, [r"Pin\s*Dia(?:meter)?", r"Pin"])
         knuckle_d_in = _extract_labeled_value(summary, [r"Knuckle\s*Dia(?:meter)?", r"Barrel\s*Dia(?:meter)?"])
         knuckle_n_in = _extract_labeled_value(summary, [r"Knuckle\s*Count", r"Knuckles"])
-        hole_d_in = _extract_labeled_value(summary, [r"Hole\s*Dia(?:meter)?", r"Mounting\s*Hole"])
-        holes_n_in = _extract_labeled_value(summary, [r"Holes?\s*Per\s*Leaf", r"Hole\s*Count"])
+        hole_d_in    = _extract_labeled_value(summary, [r"Hole\s*Dia(?:meter)?", r"Mounting\s*Hole"])
+        holes_n_in   = _extract_labeled_value(summary, [r"Holes?\s*Per\s*Leaf", r"Hole\s*Count"])
 
-        leaf_l = float(leaf_l_in if leaf_l_in is not None else (dims[0] if len(dims) >= 1 else 55.0))
-        leaf_w = float(leaf_w_in if leaf_w_in is not None else (dims[1] if len(dims) >= 2 else 26.0))
-        leaf_t = float(leaf_t_in if leaf_t_in is not None else (dims[2] if len(dims) >= 3 else 4.0))
-        pin_d = float(pin_d_in if pin_d_in is not None else (dims[3] if len(dims) >= 4 else 5.0))
+        leaf_l    = float(leaf_l_in    if leaf_l_in    is not None else (dims[0] if len(dims) >= 1 else 55.0))
+        leaf_w    = float(leaf_w_in    if leaf_w_in    is not None else (dims[1] if len(dims) >= 2 else 26.0))
+        leaf_t    = float(leaf_t_in    if leaf_t_in    is not None else (dims[2] if len(dims) >= 3 else 4.0))
+        pin_d     = float(pin_d_in     if pin_d_in     is not None else (dims[3] if len(dims) >= 4 else 5.0))
         knuckle_d = float(knuckle_d_in if knuckle_d_in is not None else (dims[4] if len(dims) >= 5 else 8.0))
         knuckle_n = int(round(knuckle_n_in if knuckle_n_in is not None else (dims[5] if len(dims) >= 6 else 5)))
-        hole_d = float(hole_d_in if hole_d_in is not None else (dims[6] if len(dims) >= 7 else 4.0))
-        holes_n = int(round(holes_n_in if holes_n_in is not None else (dims[7] if len(dims) >= 8 else 3)))
+        hole_d    = float(hole_d_in    if hole_d_in    is not None else (dims[6] if len(dims) >= 7 else 4.0))
+        holes_n   = int(round(holes_n_in if holes_n_in is not None else (dims[7] if len(dims) >= 8 else 3)))
 
         code = make_hinge(leaf_l, leaf_w, leaf_t, pin_d, knuckle_d, safe_path, knuckle_n, hole_d, holes_n)
 
@@ -1524,36 +1827,29 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         code = generate_frame(summary, safe_path)
 
     elif obj == "spring":
-        # Preferred prompt: outer or mean coil diameter + wire diameter + free length + pitch (or turns).
-        # If OD is provided, mean diameter is inferred as OD - wire_dia.
-        od_in = _extract_labeled_value(summary, [r"Outer\s*Dia(?:meter)?", r"OD"])
+        od_in       = _extract_labeled_value(summary, [r"Outer\s*Dia(?:meter)?", r"OD"])
         mean_dia_in = _extract_labeled_value(summary, [r"Mean\s*Dia(?:meter)?", r"Coil\s*Dia(?:meter)?", r"Mean\s*Diameter"])
         wire_dia_in = _extract_labeled_value(summary, [r"Wire\s*Dia(?:meter)?", r"Wire", r"Wire\s*Thickness"])
         free_len_in = _extract_labeled_value(summary, [r"Free\s*Length", r"Length", r"Height"])
-        pitch_in = _extract_labeled_value(summary, [r"Pitch"])
-        turns_in = _extract_labeled_value(summary, [r"Turns", r"Coils"])
+        pitch_in    = _extract_labeled_value(summary, [r"Pitch"])
+        turns_in    = _extract_labeled_value(summary, [r"Turns", r"Coils"])
 
-        # fallbacks to raw dims list
         if wire_dia_in is None:
             wire_dia_in = dims[1] if len(dims) >= 2 else 1.0
         wire_dia = max(float(wire_dia_in or 1.0), 0.2)
 
         if mean_dia_in is None:
             if od_in is None and dims:
-                # common case: user provides OD as first number
                 od_in = dims[0]
             if od_in is not None:
                 mean_dia_in = float(od_in) - wire_dia
             elif dims:
                 mean_dia_in = dims[0]
-        if wire_dia_in is None:
-            wire_dia_in = dims[1] if len(dims) >= 2 else 1.0
         if free_len_in is None:
             free_len_in = dims[2] if len(dims) >= 3 else 20.0
         mean_dia = max(float(mean_dia_in or 12.0), wire_dia * 1.2, 0.5)
         free_length = max(float(free_len_in or 20.0), wire_dia * 2.0, 1.0)
 
-        # If turns provided, derive pitch. Else use pitch or derive from dims[3] or default.
         if turns_in is not None and turns_in > 0:
             pitch = free_length / max(float(turns_in), 1.0)
         else:
@@ -1561,19 +1857,15 @@ def generate_fallback(summary: str, stl_path: str) -> str:
                 pitch_in = dims[3]
             pitch = float(pitch_in or max(wire_dia * 1.2, 2.0))
 
-        # Clamp pitch to avoid self-intersection.
         pitch = max(pitch, wire_dia * 1.05)
         code = make_spring(mean_dia, wire_dia, free_length, pitch, safe_path)
 
     elif obj == "rivet":
-        # Prompt supports labeled inputs or plain numbers:
-        # - Rivet shank dia, shank length, head dia, head height.
         shank_d = _extract_labeled_value(summary, [r"Shank\s*Dia(?:meter)?", r"Body\s*Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"])
         shank_l = _extract_labeled_value(summary, [r"Shank\s*Length", r"Grip\s*Length", r"Length"])
-        head_d = _extract_labeled_value(summary, [r"Head\s*Dia(?:meter)?"])
-        head_h = _extract_labeled_value(summary, [r"Head\s*Height", r"Head\s*Thickness"])
+        head_d  = _extract_labeled_value(summary, [r"Head\s*Dia(?:meter)?"])
+        head_h  = _extract_labeled_value(summary, [r"Head\s*Height", r"Head\s*Thickness"])
 
-        # numeric fallbacks
         if shank_d is None and dims:
             shank_d = dims[0]
         if shank_l is None:
@@ -1585,15 +1877,11 @@ def generate_fallback(summary: str, stl_path: str) -> str:
 
         shank_d = max(float(shank_d or 4.0), 0.5)
         shank_l = max(float(shank_l or 10.0), 0.5)
-        head_d = max(float(head_d), shank_d * 1.1)
-        head_h = max(float(head_h), 0.5)
+        head_d  = max(float(head_d), shank_d * 1.1)
+        head_h  = max(float(head_h), 0.5)
         code = make_rivet(shank_d, shank_l, head_d, head_h, safe_path)
 
     elif obj == "cone":
-        # Accept prompts like:
-        # - "cone radius 6mm height 20mm"
-        # - "cone diameter 12mm height 20mm" (interprets first value as diameter)
-        # - "cone 12 20" (defaults to diameter+height, consistent with cylinder path)
         r_in = _extract_labeled_value(summary, [r"Base\s*Radius", r"Radius", r"R\b"])
         h_in = _extract_labeled_value(summary, [r"Height", r"H\b"])
         if r_in is None and dims:
@@ -1601,7 +1889,6 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         if h_in is None:
             h_in = dims[1] if len(dims) >= 2 else 20.0
 
-        # If user explicitly said radius, treat value as radius. Otherwise treat as diameter (like cylinder).
         radius = r_in if ("radius" in lowered or re.search(r"\br\b", lowered)) else (r_in / 2.0)
         radius = max(float(radius or 10.0), 0.1)
         height = max(float(h_in or 20.0), 0.1)
@@ -1646,9 +1933,9 @@ def build_direct_summary(user_message: str) -> str | None:
         if len(dims) < 3:
             return None
         shaft_dia = _extract_labeled_value(text, [r"Shaft\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"]) or dims[0]
-        length = _extract_labeled_value(text, [r"Length", r"Shaft\s+Length"]) or (dims[1] if len(dims) >= 2 else 20.0)
-        head_dia = _extract_labeled_value(text, [r"Head\s+Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else shaft_dia * 1.8)
-        head_h = _extract_labeled_value(text, [r"Head\s+Height", r"Head\s+Thickness"])
+        length    = _extract_labeled_value(text, [r"Length", r"Shaft\s+Length"]) or (dims[1] if len(dims) >= 2 else 20.0)
+        head_dia  = _extract_labeled_value(text, [r"Head\s+Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else shaft_dia * 1.8)
+        head_h    = _extract_labeled_value(text, [r"Head\s+Height", r"Head\s+Thickness"])
         if head_h is None and len(dims) >= 5:
             head_h = dims[3]
         shape = "Round Head" if "flat" not in lowered and "hex" not in lowered else (
@@ -1679,9 +1966,9 @@ def build_direct_summary(user_message: str) -> str | None:
         if len(dims) < 3:
             return None
         shaft_dia = _extract_labeled_value(text, [r"Shaft\s+Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"]) or dims[0]
-        length = _extract_labeled_value(text, [r"Length", r"Shaft\s+Length"]) or (dims[1] if len(dims) >= 2 else 30.0)
-        head_dia = _extract_labeled_value(text, [r"Head\s+Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else shaft_dia * 1.8)
-        head_h = _extract_labeled_value(text, [r"Head\s+Height", r"Head\s+Thickness"])
+        length    = _extract_labeled_value(text, [r"Length", r"Shaft\s+Length"]) or (dims[1] if len(dims) >= 2 else 30.0)
+        head_dia  = _extract_labeled_value(text, [r"Head\s+Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else shaft_dia * 1.8)
+        head_h    = _extract_labeled_value(text, [r"Head\s+Height", r"Head\s+Thickness"])
         if head_h is None and len(dims) >= 5:
             head_h = dims[3]
         pitch = _extract_labeled_value(text, [r"Thread\s+Pitch", r"Pitch"])
@@ -1733,14 +2020,12 @@ def build_direct_summary(user_message: str) -> str | None:
         )
 
     if obj == "spring":
-        # Prefer labeled input; fall back to numeric dims:
-        # [mean_dia(or OD), wire_dia, free_length, pitch]
-        od_in = _extract_labeled_value(text, [r"Outer\s*Dia(?:meter)?", r"OD"])
+        od_in       = _extract_labeled_value(text, [r"Outer\s*Dia(?:meter)?", r"OD"])
         mean_dia_in = _extract_labeled_value(text, [r"Mean\s*Dia(?:meter)?", r"Coil\s*Dia(?:meter)?", r"Mean\s*Diameter"])
         wire_dia_in = _extract_labeled_value(text, [r"Wire\s*Dia(?:meter)?", r"Wire"])
         free_len_in = _extract_labeled_value(text, [r"Free\s*Length", r"Length", r"Height"])
-        pitch_in = _extract_labeled_value(text, [r"Pitch"])
-        turns_in = _extract_labeled_value(text, [r"Turns", r"Coils"])
+        pitch_in    = _extract_labeled_value(text, [r"Pitch"])
+        turns_in    = _extract_labeled_value(text, [r"Turns", r"Coils"])
 
         if wire_dia_in is None:
             wire_dia_in = dims[1] if len(dims) >= 2 else None
@@ -1752,10 +2037,8 @@ def build_direct_summary(user_message: str) -> str | None:
         free_length = float(free_len_in or 30.0)
         free_length = max(free_length, wire_dia * 2.0, 1.0)
 
-        # Determine mean diameter:
         if mean_dia_in is None:
             if od_in is None and dims:
-                # If user gave 12 1.2 30 ... interpret first number as OD (more common for users)
                 od_in = dims[0]
             if od_in is not None:
                 mean_dia_in = float(od_in) - wire_dia
@@ -1783,13 +2066,13 @@ def build_direct_summary(user_message: str) -> str | None:
     if obj == "rivet":
         shank_d = _extract_labeled_value(text, [r"Shank\s*Dia(?:meter)?", r"Body\s*Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"]) or (dims[0] if len(dims) >= 1 else None)
         shank_l = _extract_labeled_value(text, [r"Shank\s*Length", r"Grip\s*Length", r"Length"]) or (dims[1] if len(dims) >= 2 else None)
-        head_d = _extract_labeled_value(text, [r"Head\s*Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else None)
-        head_h = _extract_labeled_value(text, [r"Head\s*Height", r"Head\s*Thickness"]) or (dims[3] if len(dims) >= 4 else None)
+        head_d  = _extract_labeled_value(text, [r"Head\s*Dia(?:meter)?"]) or (dims[2] if len(dims) >= 3 else None)
+        head_h  = _extract_labeled_value(text, [r"Head\s*Height", r"Head\s*Thickness"]) or (dims[3] if len(dims) >= 4 else None)
 
         shank_d = max(float(shank_d or 4.0), 0.5)
         shank_l = max(float(shank_l or 12.0), 0.5)
-        head_d = max(float(head_d or (shank_d * 2.0)), shank_d * 1.2)
-        head_h = max(float(head_h or max(shank_d * 0.35, 1.5)), 0.5)
+        head_d  = max(float(head_d or (shank_d * 2.0)), shank_d * 1.2)
+        head_h  = max(float(head_h or max(shank_d * 0.35, 1.5)), 0.5)
 
         return (
             "All required parameters collected.\n"
@@ -1810,7 +2093,6 @@ def should_use_deterministic_pipeline(summary: str) -> bool:
         return False
 
     # Always use deterministic generators for these primitives/components.
-    # They are fully parametric and should not go through the LLM validator loop.
     if obj in {"spring", "rivet", "cone", "pulley", "hinge"}:
         return True
 
@@ -2114,7 +2396,7 @@ def validate(summary: str, code: str) -> str:
     if needs_hole and "hole(" not in code_lower:
         return "missing_hole"
 
-    # Do not enforce thread constraints for springs/rivets; they can mention coils/wire/pitch.
+    # Do not enforce thread constraints for springs/rivets.
     needs_thread = (obj not in {"spring", "rivet"}) and any(
         keyword in s for keyword in ("thread", "threaded", "screw", "bolt", "nut", "stud")
     )
@@ -2133,8 +2415,7 @@ def validate(summary: str, code: str) -> str:
     if "gear" in s and "polarlocations" not in code_lower:
         return "missing_gear_pattern"
 
-    # Hole-pattern validation should only trigger for explicit hole-pattern requests.
-    # Some non-hole summaries (e.g. springs) may contain generic words like "pattern".
+    # Hole-pattern validation only triggers for explicit hole-pattern requests.
     hole_pattern_requested = bool(
         re.search(r"\b(?:holes|hole\s+pattern|bolt\s+circle|multi-hole|multiple\s+holes)\b", s)
         or ("grid" in s and "hole" in s)
@@ -2439,18 +2720,18 @@ def run_pipeline(summary: str):
     # ── HARD ROUTE: PULLEY (dimension-driven, no LLM) ────────────────────────
     if detected_obj == "pulley":
         dims = parse_dims(normalized_summary)
-        od_in = _extract_labeled_value(normalized_summary, [r"Outer\s*Dia(?:meter)?", r"OD", r"Pulley\s*Dia(?:meter)?", r"Diameter"])
-        fw_in = _extract_labeled_value(normalized_summary, [r"Face\s*Width", r"Width", r"Thickness"])
-        bore_in = _extract_labeled_value(normalized_summary, [r"Bore\s*Dia(?:meter)?", r"Inner\s*Dia(?:meter)?", r"Shaft\s*Dia(?:meter)?"])
-        groove_in = _extract_labeled_value(normalized_summary, [r"Groove\s*Dia(?:meter)?"])
-        hub_in = _extract_labeled_value(normalized_summary, [r"Hub\s*Dia(?:meter)?"])
+        od_in       = _extract_labeled_value(normalized_summary, [r"Outer\s*Dia(?:meter)?", r"OD", r"Pulley\s*Dia(?:meter)?", r"Diameter"])
+        fw_in       = _extract_labeled_value(normalized_summary, [r"Face\s*Width", r"Width", r"Thickness"])
+        bore_in     = _extract_labeled_value(normalized_summary, [r"Bore\s*Dia(?:meter)?", r"Inner\s*Dia(?:meter)?", r"Shaft\s*Dia(?:meter)?"])
+        groove_in   = _extract_labeled_value(normalized_summary, [r"Groove\s*Dia(?:meter)?"])
+        hub_in      = _extract_labeled_value(normalized_summary, [r"Hub\s*Dia(?:meter)?"])
         flange_t_in = _extract_labeled_value(normalized_summary, [r"Flange\s*Thickness", r"Rim\s*Thickness"])
 
-        outer_d = float(od_in if od_in is not None else (dims[0] if len(dims) >= 1 else 80.0))
-        face_w = float(fw_in if fw_in is not None else (dims[1] if len(dims) >= 2 else max(outer_d * 0.35, 24.0)))
-        bore_d = float(bore_in if bore_in is not None else (dims[2] if len(dims) >= 3 else max(outer_d * 0.25, 12.0)))
-        groove_d = float(groove_in if groove_in is not None else (dims[3] if len(dims) >= 4 else outer_d * 0.82))
-        hub_d = float(hub_in if hub_in is not None else (dims[4] if len(dims) >= 5 else outer_d * 0.42))
+        outer_d  = float(od_in       if od_in       is not None else (dims[0] if len(dims) >= 1 else 80.0))
+        face_w   = float(fw_in       if fw_in       is not None else (dims[1] if len(dims) >= 2 else max(outer_d * 0.35, 24.0)))
+        bore_d   = float(bore_in     if bore_in     is not None else (dims[2] if len(dims) >= 3 else max(outer_d * 0.25, 12.0)))
+        groove_d = float(groove_in   if groove_in   is not None else (dims[3] if len(dims) >= 4 else outer_d * 0.82))
+        hub_d    = float(hub_in      if hub_in      is not None else (dims[4] if len(dims) >= 5 else outer_d * 0.42))
         flange_t = float(flange_t_in if flange_t_in is not None else (dims[5] if len(dims) >= 6 else face_w * 0.30))
 
         code = make_pulley(outer_d, face_w, bore_d, STL_PATH.replace("\\", "/"), groove_d, hub_d, flange_t)
@@ -2464,11 +2745,6 @@ def run_pipeline(summary: str):
         lowered = normalized_summary.lower()
         dims = parse_dims(normalized_summary)
 
-        # Parameter extraction rules (as specified):
-        # mean_dia = first number OR default 20
-        # wire_dia = second number OR default 2
-        # length   = third number OR default 50
-        # pitch    = fourth number OR default (wire_dia * 1.5)
         mean_dia = dims[0] if len(dims) >= 1 else 20.0
 
         if len(dims) >= 4:
@@ -2480,7 +2756,6 @@ def run_pipeline(summary: str):
             length = dims[2]
             pitch = float(wire_dia) * 1.5
         elif len(dims) == 2:
-            # If only 2 values: assume mean_dia, length
             mean_dia = dims[0]
             length = dims[1]
             wire_dia = float(mean_dia) * 0.1
@@ -2490,18 +2765,14 @@ def run_pipeline(summary: str):
             length = 50.0
             pitch = float(wire_dia) * 1.5
 
-        # If user gives "outer diameter": mean_dia = outer_dia - wire_dia
         outer_dia = _extract_labeled_value(normalized_summary, [r"Outer\s*Dia(?:meter)?", r"OD"])
         if outer_dia is not None:
             mean_dia = float(outer_dia) - float(wire_dia)
 
-        # Safety limits
         mean_dia = max(float(mean_dia), 2.0)
         wire_dia = max(float(wire_dia), 0.5)
-        length = max(float(length), wire_dia * 3.0)
-        pitch = max(float(pitch), wire_dia * 1.05)
-
-        # prevent impossible geometry
+        length   = max(float(length), wire_dia * 3.0)
+        pitch    = max(float(pitch), wire_dia * 1.05)
         mean_dia = max(mean_dia, wire_dia * 1.2)
 
         code = make_spring(mean_dia, wire_dia, length, pitch, STL_PATH.replace("\\", "/"))
@@ -2681,25 +2952,44 @@ def chat_handler(user_message, history):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SIMULATION HANDLER FUNCTIONS (from ok.py)
+# SIMULATION HANDLER FUNCTIONS (from ok.py — simulation_final.txt, unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_simulation(material, inner_d, outer_d, thick, hex_geom, load):
-    obj_type = sim_state.last_detected_object
-    dims = sim_engine.summary_to_dims(obj_type, [inner_d, outer_d, thick])
-    result = sim_engine.run(obj_type, dims, material, load, include_optimised=False)
+def run_simulation(component_type, temperature, load):
+    obj_type = str(component_type).strip().lower()
+    ml = _predict_from_ml_models(load, temperature, obj_type)
+
+    result = SimResult(
+        object_type=obj_type,
+        material_key=ml["material_key"],
+        material_label=ml["material_label"],
+        stress_mpa=ml["stress_mpa"],
+        max_stress_mpa=ml["stress_mpa"],
+        deformation_mm=ml["strain"],
+        safety_factor=ml["safety_factor"],
+        standard=MATERIALS[ml["material_key"]]["standard"],
+        yield_mpa=ml["yield_mpa"],
+        stress_ratio=ml["stress_ratio"],
+        mass_g=ml["yield_mpa"],
+    )
+    if result.safety_factor >= 2.0:
+        result.compliance_color = "#22d3a0"
+    elif result.safety_factor >= 1.5:
+        result.compliance_color = "#f59e0b"
+    else:
+        result.compliance_color = "#ef4444"
 
     sim_state.sim_history.append({
         "load": load, "sf": result.safety_factor,
         "stress": result.stress_mpa, "deform": result.deformation_mm
     })
 
-    sf_fig = create_sf_plot(sim_state.sim_history, result.standard)
-    deform_fig = create_deform_plot(sim_state.sim_history)
+    sf_fig      = create_sf_plot(sim_state.sim_history, result.standard)
+    deform_fig  = create_deform_plot(sim_state.sim_history)
     heatmap_fig = create_heatmap(result, obj_type)
-    gauge_fig = create_compliance_gauge(result)
+    gauge_fig   = create_compliance_gauge(result)
 
-    params = {"load": load}
+    params = {"load": load, "temperature": temperature, "component_type": obj_type}
     report = ai_explainer.generate_report(params, result, None, None)
     show_failure = result.safety_factor < 1.2
 
@@ -2717,23 +3007,27 @@ def run_simulation(material, inner_d, outer_d, thick, hex_geom, load):
     )
 
 
-def find_failure(material, inner_d, outer_d, thick, hex_geom):
-    obj_type = sim_state.last_detected_object
-    low, high = 0, 50000
-    for _ in range(20):
-        mid = (low + high) / 2
-        dims = sim_engine.summary_to_dims(obj_type, [inner_d, outer_d, thick])
-        result = sim_engine.run(obj_type, dims, material, mid, include_optimised=False)
-        if result.safety_factor < 1.0:
-            high = mid
-        else:
-            low = mid
-
-    failure_load = (low + high) / 2
+def find_failure(component_type, temperature, load):
+    obj_type = str(component_type).strip().lower()
+    baseline_temp = float(temperature)
+    applied_load  = float(load)
+    ml_at_applied = _predict_from_ml_models(applied_load, baseline_temp, obj_type)
+    failure_load  = applied_load * float(ml_at_applied["safety_factor"])
     sim_state.failure_point = failure_load
 
-    dims = sim_engine.summary_to_dims(obj_type, [inner_d, outer_d, thick])
-    result = sim_engine.run(obj_type, dims, material, failure_load, include_optimised=False)
+    ml_fail = _predict_from_ml_models(failure_load, baseline_temp, obj_type)
+    result = SimResult(
+        object_type=obj_type,
+        material_key=ml_fail["material_key"],
+        material_label=ml_fail["material_label"],
+        stress_mpa=ml_fail["stress_mpa"],
+        max_stress_mpa=ml_fail["stress_mpa"],
+        deformation_mm=ml_fail["strain"],
+        safety_factor=ml_fail["safety_factor"],
+        standard=MATERIALS[ml_fail["material_key"]]["standard"],
+        yield_mpa=ml_fail["yield_mpa"],
+        stress_ratio=ml_fail["stress_ratio"],
+    )
     failure_mode = "Yield Failure (Plastic Deformation)" if result.stress_mpa > result.yield_mpa else "Buckling/Instability"
 
     params = {"load": failure_load}
@@ -2745,7 +3039,7 @@ def find_failure(material, inner_d, outer_d, thick, hex_geom):
     )
 
     return (
-        failure_load,
+        applied_load,
         result.safety_factor,
         result.stress_mpa,
         f"## 💥 FAILURE FOUND AT {failure_load:.0f}N\n\n{report}",
@@ -2776,6 +3070,23 @@ CUSTOM_CSS = """
 label,#label-text{color:#8899aa !important;font-family:monospace !important;text-transform:uppercase !important;letter-spacing:1px !important;font-size:0.8em !important;}
 #footer{text-align:center;padding:12px 0;border-top:1px solid #1e2a3a;margin-top:10px;}
 #footer p{color:#3a4a5a;font-family:monospace;font-size:0.72em;letter-spacing:2px;}
+#landing-screen{min-height:86vh;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;background:radial-gradient(circle at 20% 20%,rgba(34,211,160,0.12),transparent 35%),radial-gradient(circle at 80% 0%,rgba(59,130,246,0.16),transparent 32%),#0f1319;border:1px solid #1e2a3a;border-radius:18px;margin-top:12px;}
+.hero-card{position:relative;z-index:2;max-width:860px;text-align:center;padding:46px 34px;border:1px solid #2a3a4a;border-radius:20px;background:linear-gradient(180deg,rgba(17,24,32,0.9),rgba(15,19,25,0.88));box-shadow:0 20px 80px rgba(0,0,0,0.45);}
+.hero-title{font-size:3.2rem;font-weight:800;letter-spacing:2px;line-height:1.05;margin:0;color:#e0f7ef;text-shadow:0 0 25px rgba(34,211,160,0.25);}
+.hero-sub{margin:16px auto 0 auto;max-width:760px;color:#8ea0b3;font-size:1.06rem;line-height:1.6;min-height:56px;}
+.hero-chip{display:inline-block;margin-top:18px;padding:7px 14px;border:1px solid #2c425f;border-radius:999px;color:#7dc9ff;background:rgba(17,34,50,0.55);font-family:monospace;letter-spacing:1px;}
+#start-building-btn{margin-top:28px !important;padding:14px 28px !important;border-radius:14px !important;border:1px solid rgba(34,211,160,0.7) !important;background:linear-gradient(135deg,#22d3a0,#3b82f6) !important;color:#091018 !important;font-weight:800 !important;letter-spacing:1px !important;box-shadow:0 8px 30px rgba(34,211,160,0.28) !important;transition:all .25s ease !important;}
+#start-building-btn:hover{transform:translateY(-2px) scale(1.02);box-shadow:0 14px 38px rgba(59,130,246,0.35) !important;}
+#start-building-btn:active{transform:scale(0.98);}
+.hero-orb{position:absolute;border-radius:999px;filter:blur(2px);opacity:.4;animation:floaty 9s ease-in-out infinite;}
+.orb-a{width:260px;height:260px;left:-60px;top:-50px;background:radial-gradient(circle,#22d3a0,transparent 65%);}
+.orb-b{width:300px;height:300px;right:-90px;bottom:-80px;background:radial-gradient(circle,#3b82f6,transparent 65%);animation-delay:1.5s;}
+.orb-c{width:180px;height:180px;right:16%;top:8%;background:radial-gradient(circle,#06b6d4,transparent 65%);animation-delay:3.2s;}
+.component-stream{position:absolute;z-index:1;inset:0;pointer-events:none;overflow:hidden;}
+.component-pill{position:absolute;padding:6px 10px;border:1px solid #2a3a4a;border-radius:999px;color:#89a3b8;background:rgba(12,18,26,0.65);font-size:.76rem;font-family:monospace;animation:drift 14s linear infinite;}
+.p1{left:8%;top:18%;animation-delay:0s}.p2{left:18%;top:72%;animation-delay:2.5s}.p3{left:34%;top:28%;animation-delay:1.2s}.p4{left:52%;top:76%;animation-delay:4.2s}.p5{left:67%;top:24%;animation-delay:3.5s}.p6{left:81%;top:66%;animation-delay:5.5s}.p7{left:73%;top:12%;animation-delay:6.2s}.p8{left:12%;top:48%;animation-delay:7.1s}
+@keyframes drift{0%{transform:translateY(0px) translateX(0px);}50%{transform:translateY(-14px) translateX(8px);}100%{transform:translateY(0px) translateX(0px);}}
+@keyframes floaty{0%,100%{transform:translateY(0px) translateX(0px);}50%{transform:translateY(-14px) translateX(8px);}}
 """
 
 
@@ -2796,168 +3107,223 @@ def create_ui():
         ),
     ) as app:
 
-        # ── Header ──────────────────────────────────────────────────────
-        gr.HTML("""
-        <div id="header">
-            <h1>MEC<span style="color:#3b82f6">H</span>-AI</h1>
-            <p>AI-Powered Mechanical Design &amp; Simulation Platform</p>
-        </div>
-        """)
+        with gr.Group(visible=False, elem_id="landing-screen") as landing_view:
+            gr.HTML("""
+            <div class="hero-orb orb-a"></div>
+            <div class="hero-orb orb-b"></div>
+            <div class="hero-orb orb-c"></div>
+            <div class="component-stream">
+                <span class="component-pill p1">BOLT</span>
+                <span class="component-pill p2">GEAR</span>
+                <span class="component-pill p3">BEARING</span>
+                <span class="component-pill p4">SCREW</span>
+                <span class="component-pill p5">SPRING</span>
+                <span class="component-pill p6">PULLEY</span>
+                <span class="component-pill p7">BRACKET</span>
+                <span class="component-pill p8">NUT</span>
+            </div>
+            <div class="hero-card">
+                <h1 class="hero-title">MECH-AI</h1>
+                <p class="hero-sub"><span id="typed-hero-line"></span></p>
+                <div class="hero-chip">Ollama + build123d + ML Simulation</div>
+            </div>
+            <script>
+            (function () {
+                const lines = [
+                    "Design mechanical components with AI precision.",
+                    "Simulate stress and safety in interactive 3D.",
+                    "Build faster with modelling + simulation in one flow."
+                ];
+                const el = document.getElementById("typed-hero-line");
+                if (!el) return;
+                let li = 0, ci = 0, deleting = false;
+                function tick() {
+                    const text = lines[li];
+                    if (!deleting) {
+                        ci = Math.min(ci + 1, text.length);
+                    } else {
+                        ci = Math.max(ci - 1, 0);
+                    }
+                    el.textContent = text.slice(0, ci);
+                    let delay = deleting ? 35 : 55;
+                    if (!deleting && ci === text.length) { deleting = true; delay = 1300; }
+                    else if (deleting && ci === 0) { deleting = false; li = (li + 1) % lines.length; delay = 300; }
+                    setTimeout(tick, delay);
+                }
+                tick();
+            })();
+            </script>
+            """)
+            start_btn = gr.Button("Start Building", elem_id="start-building-btn", variant="primary")
 
-        # ── Tab navigation ───────────────────────────────────────────────
-        with gr.Tabs():
+        with gr.Group(visible=True) as main_view:
+            # ── Header ──────────────────────────────────────────────────────
+            gr.HTML("""
+            <div id="header">
+                <h1>MEC<span style="color:#3b82f6">H</span>-AI</h1>
+                <p>AI-Powered Mechanical Design &amp; Simulation Platform</p>
+            </div>
+            """)
 
-            # ════════════════════════════════════════════════════════════
-            # TAB 1 — MODELLING (unchanged from modelling.py)
-            # ════════════════════════════════════════════════════════════
-            with gr.TabItem("🔧 3D Modelling"):
-                gr.Markdown("Describe your component in natural language. MECHAI generates optimised CAD via Ollama + build123d.")
+            # ── Tab navigation ───────────────────────────────────────────────
+            with gr.Tabs():
 
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        chatbot = gr.Chatbot(
-                            value=[{"role": "assistant",
-                                    "content": "Hello! I'm **MECHAI**, your AI-powered mechanical design assistant.\n\nWhat are we designing today?"}],
-                            elem_classes=["chatbot"], height=480, show_label=False,
-                        )
-                        with gr.Row():
-                            user_input = gr.Textbox(
-                                placeholder="e.g. 'M6 screw, 30mm long' or 'hex nut inner 10mm outer 20mm thick 8mm'",
-                                show_label=False, elem_id="user-input", scale=5, lines=1, max_lines=3,
+                # ════════════════════════════════════════════════════════════
+                # TAB 1 — MODELLING (unchanged from modelling.py)
+                # ════════════════════════════════════════════════════════════
+                with gr.TabItem("🔧 3D Modelling"):
+                    gr.Markdown("Describe your component in natural language. MECHAI generates optimised CAD via Ollama + build123d.")
+
+                    with gr.Row():
+                        with gr.Column(scale=3):
+                            chatbot = gr.Chatbot(
+                                value=[{"role": "assistant",
+                                        "content": "Hello! I'm **MECHAI**, your AI-powered mechanical design assistant.\n\nWhat are we designing today?"}],
+                                elem_classes=["chatbot"], height=480, show_label=False,
                             )
-                            send_btn = gr.Button("Send ➤", elem_id="send-btn", scale=1, variant="primary")
-                        clear_btn = gr.Button("🔄 New Design", size="sm")
+                            with gr.Row():
+                                user_input = gr.Textbox(
+                                    placeholder="e.g. 'M6 screw, 30mm long' or 'hex nut inner 10mm outer 20mm thick 8mm'",
+                                    show_label=False, elem_id="user-input", scale=5, lines=1, max_lines=3,
+                                )
+                                send_btn = gr.Button("Send ➤", elem_id="send-btn", scale=1, variant="primary")
+                            clear_btn = gr.Button("🔄 New Design", size="sm")
 
-                    with gr.Column(scale=2):
-                        gr.Markdown("#### 🎯 3D Model Viewer")
-                        model_viewer = gr.Model3D(
-                            label="Generated Model", elem_id="model-viewer",
-                            height=480, clear_color=[0.059, 0.075, 0.098, 1.0],
-                        )
-                        gr.Markdown("*Your 3D model will appear here after generation.*")
-
-                # Events for modelling tab
-                send_btn.click(
-                    fn=chat_handler,
-                    inputs=[user_input, chatbot],
-                    outputs=[user_input, chatbot, model_viewer]
-                )
-                user_input.submit(
-                    fn=chat_handler,
-                    inputs=[user_input, chatbot],
-                    outputs=[user_input, chatbot, model_viewer]
-                )
-                clear_btn.click(
-                    fn=lambda: (
-                        [{"role": "assistant", "content": "Ready for a new design! What would you like to create?"}],
-                        None
-                    ),
-                    outputs=[chatbot, model_viewer],
-                )
-
-            # ════════════════════════════════════════════════════════════
-            # TAB 2 — SIMULATION (from ok.py)
-            # ════════════════════════════════════════════════════════════
-            with gr.TabItem("⚡ Simulation Lab"):
-                gr.Markdown("## ⚡ Simulation Lab")
-                gr.Markdown("Real-time FEA with AI-driven optimization. Uses the last modelled object automatically, or adjust parameters manually.")
-
-                with gr.Row():
-                    # ── Controls ─────────────────────────────────────────
-                    with gr.Column(scale=1):
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("### 🎛️ Parameters")
-
-                            sim_material = gr.Dropdown(
-                                choices=list(MATERIALS.keys()), value="steel", label="Material"
+                        with gr.Column(scale=2):
+                            gr.Markdown("#### 🎯 3D Model Viewer")
+                            model_viewer = gr.Model3D(
+                                label="Generated Model", elem_id="model-viewer",
+                                height=480, clear_color=[0.059, 0.075, 0.098, 1.0],
                             )
-                            with gr.Row():
-                                sim_inner = gr.Slider(5, 100, value=10, step=0.5, label="Inner/Shaft Dia (mm)")
-                                sim_outer = gr.Slider(10, 200, value=20, step=0.5, label="Outer/Head Dia (mm)")
-                            sim_thick = gr.Slider(2, 100, value=8, step=0.5, label="Thickness/Length (mm)")
-                            sim_hex = gr.Checkbox(value=True, label="Hex Geometry")
+                            gr.Markdown("*Your 3D model will appear here after generation.*")
 
-                            gr.Markdown("### ⚡ Load")
-                            sim_load = gr.Slider(100, 10000, value=500, step=100, label="Applied Load (N)")
+                    # Events for modelling tab
+                    send_btn.click(
+                        fn=chat_handler,
+                        inputs=[user_input, chatbot],
+                        outputs=[user_input, chatbot, model_viewer]
+                    )
+                    user_input.submit(
+                        fn=chat_handler,
+                        inputs=[user_input, chatbot],
+                        outputs=[user_input, chatbot, model_viewer]
+                    )
+                    clear_btn.click(
+                        fn=lambda: (
+                            [{"role": "assistant", "content": "Ready for a new design! What would you like to create?"}],
+                            None
+                        ),
+                        outputs=[chatbot, model_viewer],
+                    )
 
-                            with gr.Row():
-                                run_sim_btn = gr.Button("▶️ Run Sim", variant="primary")
-                                find_fail_btn = gr.Button("💥 Find Failure", variant="stop")
+                # ════════════════════════════════════════════════════════════
+                # TAB 2 — SIMULATION (from ok.py — simulation_final.txt, unchanged)
+                # ════════════════════════════════════════════════════════════
+                with gr.TabItem("⚡ Simulation Lab"):
+                    gr.Markdown("## ⚡ Simulation Lab")
+                    gr.Markdown("Real-time FEA with AI-driven optimization. Uses the last modelled object automatically, or adjust parameters manually.")
 
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("### 📊 Metrics")
-                            with gr.Row():
-                                sf_metric = gr.Number(label="Safety Factor", value=2.0)
-                                stress_metric = gr.Number(label="Stress (MPa)", value=0)
-                            with gr.Row():
-                                deform_metric = gr.Number(label="Deform (mm)", value=0)
-                                mass_metric = gr.Number(label="Mass (g)", value=0)
+                    with gr.Row():
+                        # ── Controls ─────────────────────────────────────────
+                        with gr.Column(scale=1):
+                            with gr.Group(elem_classes=["panel"]):
+                                gr.Markdown("### 🎛️ Parameters")
 
-                    # ── Visualizations ────────────────────────────────────
-                    with gr.Column(scale=2):
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("### 🌡️ 3D Stress Heatmap")
-                            heatmap_plot = gr.Plot()
-                            gr.HTML("""
-                            <div style="display:flex;align-items:center;gap:10px;margin-top:8px;">
-                                <span style="color:#0088ff;font-size:0.8em;">Low Stress</span>
-                                <div class="gradient-bar"></div>
-                                <span style="color:#ff2222;font-size:0.8em;">Yield</span>
-                            </div>
-                            """)
+                                sim_component = gr.Dropdown(
+                                    choices=[
+                                        "bolt", "screw", "nut", "washer", "gear", "bearing", "pulley",
+                                        "sprocket", "spring", "shaft", "hinge", "bracket", "rivet",
+                                        "bushing", "coupling", "cube", "cuboid", "box", "cylinder",
+                                        "sphere", "cone"
+                                    ],
+                                    value="bolt",
+                                    label="Component Type"
+                                )
+                                sim_temperature = gr.Slider(-50, 400, value=25, step=1, label="Temperature (°C)")
 
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("### 📈 Response Curves")
-                            with gr.Tabs():
-                                with gr.TabItem("Safety Factor"):
-                                    sf_curve = gr.Plot()
-                                with gr.TabItem("Deformation"):
-                                    deform_curve = gr.Plot()
+                                gr.Markdown("### ⚡ Load")
+                                sim_load = gr.Slider(100, 10000, value=500, step=100, label="Applied Load (N)")
 
-                    # ── AI Analysis ───────────────────────────────────────
-                    with gr.Column(scale=1):
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("### 🤖 AI Analysis")
-                            compliance_gauge = gr.Plot()
+                                with gr.Row():
+                                    run_sim_btn  = gr.Button("▶️ Run Sim", variant="primary")
+                                    find_fail_btn = gr.Button("💥 Find Failure", variant="stop")
 
-                            with gr.Group(visible=False) as failure_panel:
+                            with gr.Group(elem_classes=["panel"]):
+                                gr.Markdown("### 📊 Metrics")
+                                with gr.Row():
+                                    sf_metric     = gr.Number(label="Safety Factor", value=2.0)
+                                    stress_metric = gr.Number(label="Stress (MPa)", value=0)
+                                with gr.Row():
+                                    deform_metric = gr.Number(label="Strain", value=0)
+                                    mass_metric   = gr.Number(label="Yield Point (MPa)", value=0)
+
+                        # ── Visualizations ────────────────────────────────────
+                        with gr.Column(scale=2):
+                            with gr.Group(elem_classes=["panel"]):
+                                gr.Markdown("### 🌡️ 3D Stress Heatmap")
+                                heatmap_plot = gr.Plot()
                                 gr.HTML("""
-                                <div class="failure-alert">
-                                    <h3 style="color:#ef4444;margin-top:0;">⚠️ FAILURE PREDICTED</h3>
-                                    <p>Reduce load or upgrade material.</p>
+                                <div style="display:flex;align-items:center;gap:10px;margin-top:8px;">
+                                    <span style="color:#0088ff;font-size:0.8em;">Low Stress</span>
+                                    <div class="gradient-bar"></div>
+                                    <span style="color:#ff2222;font-size:0.8em;">Yield</span>
                                 </div>
                                 """)
 
-                            ai_report = gr.Markdown()
+                            with gr.Group(elem_classes=["panel"]):
+                                gr.Markdown("### 📈 Response Curves")
+                                with gr.Tabs():
+                                    with gr.TabItem("Safety Factor"):
+                                        sf_curve = gr.Plot()
+                                    with gr.TabItem("Strain"):
+                                        deform_curve = gr.Plot()
 
-                # ── Simulation Events ────────────────────────────────────
-                sim_outputs = [
-                    sf_metric, stress_metric, deform_metric, mass_metric,
-                    sf_curve, deform_curve, heatmap_plot, compliance_gauge,
-                    ai_report, failure_panel
-                ]
+                        # ── AI Analysis ───────────────────────────────────────
+                        with gr.Column(scale=1):
+                            with gr.Group(elem_classes=["panel"]):
+                                gr.Markdown("### 🤖 AI Analysis")
+                                compliance_gauge = gr.Plot()
 
-                run_sim_btn.click(
-                    fn=run_simulation,
-                    inputs=[sim_material, sim_inner, sim_outer, sim_thick, sim_hex, sim_load],
-                    outputs=sim_outputs
-                )
+                                with gr.Group(visible=False) as failure_panel:
+                                    gr.HTML("""
+                                    <div class="failure-alert">
+                                        <h3 style="color:#ef4444;margin-top:0;">⚠️ FAILURE PREDICTED</h3>
+                                        <p>Reduce load or upgrade material.</p>
+                                    </div>
+                                    """)
 
-                find_fail_btn.click(
-                    fn=find_failure,
-                    inputs=[sim_material, sim_inner, sim_outer, sim_thick, sim_hex],
-                    outputs=[sim_load, sf_metric, stress_metric, ai_report, failure_panel, sf_curve]
-                )
+                                ai_report = gr.Markdown()
 
-                # Live slider updates
-                for component in [sim_material, sim_inner, sim_outer, sim_thick, sim_hex, sim_load]:
-                    component.change(
+                    # ── Simulation Events ────────────────────────────────────
+                    sim_outputs = [
+                        sf_metric, stress_metric, deform_metric, mass_metric,
+                        sf_curve, deform_curve, heatmap_plot, compliance_gauge,
+                        ai_report, failure_panel
+                    ]
+
+                    run_sim_btn.click(
                         fn=run_simulation,
-                        inputs=[sim_material, sim_inner, sim_outer, sim_thick, sim_hex, sim_load],
+                        inputs=[sim_component, sim_temperature, sim_load],
                         outputs=sim_outputs
                     )
 
-        gr.HTML('<div id="footer"><p>MECH-AI ENGINE &bull; Ollama + build123d + FEA Simulation</p></div>')
+                    find_fail_btn.click(
+                        fn=find_failure,
+                        inputs=[sim_component, sim_temperature, sim_load],
+                        outputs=[sim_load, sf_metric, stress_metric, ai_report, failure_panel, sf_curve]
+                    )
+
+                    # Live slider updates
+                    for component in [sim_component, sim_temperature, sim_load]:
+                        component.change(
+                            fn=run_simulation,
+                            inputs=[sim_component, sim_temperature, sim_load],
+                            outputs=sim_outputs
+                        )
+
+            gr.HTML('<div id="footer"><p>MECH-AI ENGINE &bull; Ollama + build123d + FEA Simulation</p></div>')
+
+        # Landing flow disabled in app; use external index.html as entry page.
 
     return app
 
@@ -2973,8 +3339,5 @@ if __name__ == "__main__":
     print("  Server: http://localhost:7860")
     print("=" * 60)
     create_ui().launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
         inbrowser=True,
     )
