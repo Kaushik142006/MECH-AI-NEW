@@ -3172,7 +3172,7 @@ def create_ui():
                 # TAB 1 — MODELLING (unchanged from modelling.py)
                 # ════════════════════════════════════════════════════════════
                 with gr.TabItem("🔧 3D Modelling"):
-                    gr.Markdown("Describe your component in natural language. MECHAI generates optimised CAD via Ollama + build123d.")
+                    gr.Markdown("Describe your component in natural language.")
 
                     with gr.Row():
                         with gr.Column(scale=3):
