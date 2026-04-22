@@ -1,4 +1,5 @@
 """
+BEVEL GEAR SEMI
 ═══════════════════════════════════════════════════════════════════════════════
                     MECH-AI INTEGRATED PLATFORM
          AI-Assisted 3D Modelling + Simulation Platform
@@ -137,7 +138,14 @@ def make_cylinder(radius, height, stl_path):
         f"export_stl(b.part, '{stl_path}')\n"
     )
 
-
+def make_sphere(diameter, stl_path):
+    radius = diameter / 2.0
+    return (
+        "from build123d import *\n"
+        f"with BuildPart() as b:\n"
+        f"    Sphere(radius={radius})\n"
+        f"export_stl(b.part, '{stl_path}')\n"
+    )
 def make_cylinder_with_hole(radius, height, hole_r, stl_path):
     return (
         "from build123d import *\n"
@@ -506,6 +514,8 @@ def _requires_four_corners(summary: str) -> bool:
 def detect_object(summary: str) -> str:
     s = summary.lower()
     # High-priority component keywords (must win even if prompt mentions screws/bolts/etc.)
+    if "sphere" in s:
+        return "sphere"
     if any(w in s for w in ["spring", "coil spring", "compression spring", "extension spring", "helical spring", "coil"]):
         return "spring"
     if any(w in s for w in ["rivet", "pop rivet", "blind rivet", "solid rivet"]):
@@ -535,6 +545,11 @@ def detect_object(summary: str) -> str:
     if any(w in s for w in ["cylinder", "rod", "pipe", "tube"]):
         return "cylinder"
     if any(w in s for w in ["gear", "tooth", "teeth"]):
+        # Check for bevel gear first, then helical gear
+        if "bevel" in s:
+            return "bevel_gear"
+        if "helical" in s:
+            return "helical_gear"
         return "gear"
     if any(w in s for w in ["helmet", "visor", "head shell"]):
         return "helmet"
@@ -561,6 +576,10 @@ def classify_object(summary: str) -> str:
     if any(w in s for w in ("screw", "bolt", "nut", "washer", "bushing", "fastener", "thread", "threaded")):
         return "fastener"
     if any(w in s for w in ("gear", "tooth", "teeth")):
+        if "bevel" in s:
+            return "bevel_gear"
+        if "helical" in s:
+            return "helical_gear"
         return "gear"
     if any(w in s for w in ("table", "frame", "assembly", "chassis", "multi-part", "multipart")):
         return "assembly"
@@ -578,32 +597,277 @@ def _extract_hole_count(summary: str, default: int = 4) -> int:
     return max(default, 1)
 
 
+# ================= CORRECTED GEAR GENERATION (full 2D polygon) =================
 def generate_gear(summary: str, stl_path: str) -> str:
+    """
+    Generate a spur gear with central hole by creating a single 2D polygon
+    that traces the gear outline (root circle + tooth tips) and extruding.
+    This ensures teeth are always visible and correctly oriented.
+    """
+    import math
+
     safe_path = stl_path.replace("\\", "/")
     dims = parse_dims(summary)
+    lowered = summary.lower()
+
+    # Extract gear parameters
     outer_dia = dims[0] if len(dims) >= 1 else 60.0
     thickness = dims[1] if len(dims) >= 2 else 10.0
     tooth_count = int(round(dims[2])) if len(dims) >= 3 else 20
     tooth_depth = dims[3] if len(dims) >= 4 else max(outer_dia * 0.08, 2.0)
     tooth_count = max(tooth_count, 8)
-    root_radius = max((outer_dia / 2.0) - tooth_depth, outer_dia * 0.2)
-    pitch_circ = 2.0 * 3.14159265 * (outer_dia / 2.0)
-    tooth_width = max((pitch_circ / tooth_count) * 0.45, tooth_depth * 0.8)
+
+    # Extract central hole diameter
+    hole_dia = _extract_labeled_value(summary, [r"Central\s+hole", r"Hole\s+diameter", r"Bore\s+diameter", r"Inner\s+diameter"])
+    if hole_dia is None and len(dims) >= 5:
+        hole_dia = dims[4]
+    if hole_dia is None:
+        hole_dia = 0.0
+
+    outer_radius = outer_dia / 2.0
+    root_radius = outer_radius - tooth_depth
+    if root_radius <= 0:
+        root_radius = outer_radius * 0.6
+
+    # Generate points for the gear outline
+    points = []
+    angle_step = 2.0 * math.pi / tooth_count
+
+    # Tooth width at root (tangential) - approximate
+    pitch_radius = outer_radius - tooth_depth / 2.0
+    tooth_width = (2.0 * math.pi * pitch_radius / tooth_count) * 0.45
+
+    for i in range(tooth_count):
+        angle_center = i * angle_step
+
+        # Left and right angles of the tooth at outer radius
+        half_tooth_angle = tooth_width / (2.0 * outer_radius)
+        angle_left = angle_center - half_tooth_angle
+        angle_right = angle_center + half_tooth_angle
+
+        # Root arc points (optional: add a point on root circle between teeth)
+        # We'll add a point at root radius slightly before the tooth
+        root_angle_before = angle_center - angle_step * 0.45
+        x_root_before = root_radius * math.cos(root_angle_before)
+        y_root_before = root_radius * math.sin(root_angle_before)
+        points.append((x_root_before, y_root_before))
+
+        # Tooth tip points (outer radius)
+        x_tip_left = outer_radius * math.cos(angle_left)
+        y_tip_left = outer_radius * math.sin(angle_left)
+        x_tip_right = outer_radius * math.cos(angle_right)
+        y_tip_right = outer_radius * math.sin(angle_right)
+        points.append((x_tip_left, y_tip_left))
+        points.append((x_tip_right, y_tip_right))
+
+    # Close the polygon
+    if points:
+        points.append(points[0])
+
+    # Build the code string
+    code_lines = [
+        "from build123d import *",
+        "import math",
+        f"outer_radius = {outer_radius}",
+        f"root_radius = {root_radius}",
+        f"tooth_count = {tooth_count}",
+        f"thickness = {thickness}",
+        "# Gear outline points",
+        "points = " + repr(points),
+        "with BuildPart() as b:",
+        "    with BuildSketch(Plane.XY) as sk:",
+        "        with BuildLine():",
+        "            Polyline(*points, close=True)",
+        "        make_face()",
+        "    extrude(amount=thickness)",
+    ]
+    if hole_dia > 0:
+        hole_radius = hole_dia / 2.0
+        code_lines.append(f"    Hole(radius={hole_radius}, depth=thickness)")
+    code_lines.append(f"export_stl(b.part, '{safe_path}')")
+    return "\n".join(code_lines)
+
+
+# ================= NEW: BEVEL GEAR GENERATION =================
+def generate_bevel_gear(summary: str, stl_path: str) -> str:
+    import math
+
+    safe_path = stl_path.replace("\\", "/")
+    dims = parse_dims(summary)
+
+    # Expected order:
+    # [outer_diameter, face_width, tooth_count, hole_diameter, tooth_depth(optional)]
+    outer_dia = dims[0] if len(dims) >= 1 else 60.0
+    face_width = dims[1] if len(dims) >= 2 else 10.0
+    tooth_count = int(round(dims[2])) if len(dims) >= 3 else 20
+    hole_dia = dims[3] if len(dims) >= 4 else 12.0
+    tooth_depth = dims[4] if len(dims) >= 5 else max(outer_dia * 0.12, 2.0)
+
+    tooth_count = max(tooth_count, 8)
+
+    outer_radius = max(float(outer_dia) / 2.0, 1.0)
+    face_width = max(float(face_width), 1.0)
+    hole_radius = max(float(hole_dia) / 2.0, 0.1)
+
+    # Limit tooth depth
+    tooth_depth = min(max(float(tooth_depth), 1.0), outer_radius * 0.45)
+
+    # Root and top radii for frustum body
+    root_radius = outer_radius - tooth_depth
+    top_radius = max(root_radius - face_width * 0.6, root_radius * 0.3)
+
+    if top_radius <= 0:
+        top_radius = root_radius * 0.5
+
+    # Tooth span around circumference
+    tooth_span = (2.0 * math.pi * root_radius / tooth_count) * 0.42
+
+    # Taper angle for teeth
+    tooth_taper = math.degrees(
+        math.atan(max(root_radius - top_radius, 0.1) / max(face_width, 0.1))
+    )
+
+    return f'''from build123d import *
+import math
+
+outer_radius = {outer_radius}
+root_radius = {root_radius}
+top_radius = {top_radius}
+face_width = {face_width}
+tooth_count = {tooth_count}
+hole_radius = {hole_radius}
+tooth_depth = {tooth_depth}
+tooth_span = {tooth_span}
+tooth_taper = {tooth_taper}
+
+with BuildPart() as b:
+    # Bevel gear body (frustum)
+    Cone(bottom_radius=root_radius, top_radius=top_radius, height=face_width)
+
+    # TEETH (properly attached)
+    with BuildSketch(Plane.XY):
+        with PolarLocations(root_radius - tooth_depth * 0.3, tooth_count):
+            Rectangle(tooth_depth, tooth_span)
+
+    # IMPORTANT: ensure merge + no gap
+    extrude(amount=face_width, taper=-tooth_taper, mode=Mode.ADD)
+
+
+    # Central bore
+    if hole_radius > 0:
+        Hole(radius=hole_radius, depth=face_width + 1.0)
+
+export_stl(b.part, "{safe_path}")
+'''
+
+
+# ================= NEW: HELICAL GEAR GENERATION =================
+def generate_helical_gear(summary: str, stl_path: str) -> str:
+    """
+    Generate a parametric helical gear with angled teeth.
+    Uses a loft-based approach: creates the gear tooth profile (same polygon
+    as the spur gear) at multiple Z heights, each progressively rotated by
+    the twist angle, then lofts through all sections to produce the helical shape.
+
+    Parameters (in order from summary):
+      [outer_diameter, face_width, tooth_count, helix_angle_deg, hole_diameter, tooth_depth]
+    """
+    import math
+
+    safe_path = stl_path.replace("\\", "/")
+    dims = parse_dims(summary)
+
+    # Extract gear parameters with sensible defaults
+    outer_dia   = dims[0] if len(dims) >= 1 else 60.0
+    face_width  = dims[1] if len(dims) >= 2 else 15.0
+    tooth_count = int(round(dims[2])) if len(dims) >= 3 else 20
+    helix_angle = dims[3] if len(dims) >= 4 else 25.0
+    hole_dia    = dims[4] if len(dims) >= 5 else 12.0
+    tooth_depth = dims[5] if len(dims) >= 6 else max(outer_dia * 0.08, 2.0)
+
+    # Also try labeled extraction
+    ha_labeled = _extract_labeled_value(summary, [r"Helix\s+Angle", r"Helical\s+Angle", r"Angle"])
+    if ha_labeled is not None:
+        helix_angle = ha_labeled
+    hole_labeled = _extract_labeled_value(summary, [r"Central\s+hole", r"Hole\s+diameter",
+                                                     r"Bore\s+diameter", r"Inner\s+diameter"])
+    if hole_labeled is not None:
+        hole_dia = hole_labeled
+
+    tooth_count  = max(tooth_count, 8)
+    outer_radius = max(float(outer_dia) / 2.0, 1.0)
+    face_width   = max(float(face_width), 1.0)
+    helix_angle  = max(min(float(helix_angle), 45.0), 5.0)
+    hole_radius  = max(float(hole_dia) / 2.0, 0.0)
+    tooth_depth  = min(max(float(tooth_depth), 1.0), outer_radius * 0.4)
+
+    root_radius = outer_radius - tooth_depth
+    if root_radius <= 0:
+        root_radius = outer_radius * 0.6
+
+    # Helix pitch from helix angle
+    pitch_radius = (outer_radius + root_radius) / 2.0
+    helix_angle_rad = math.radians(helix_angle)
+    helix_pitch = (2.0 * math.pi * pitch_radius) / max(math.tan(helix_angle_rad), 0.05)
+
+    # Total twist across the face width (degrees)
+    twist_total = (face_width / helix_pitch) * 360.0
+
+    # Number of loft sections (more sections = smoother helix)
+    num_sections = max(int(round(abs(twist_total) / 5.0)), 2)
+    num_sections = min(num_sections, 10)
+
     return (
         "from build123d import *\n"
-        f"root_radius = {root_radius}\n"
-        f"thickness = {thickness}\n"
-        f"tooth_count = {tooth_count}\n"
-        f"tooth_depth = {tooth_depth}\n"
-        f"tooth_width = {tooth_width}\n"
+        "import math\n"
+        "\n"
+        "# -- Helical Gear Parameters (all parametric) --\n"
+        f"outer_radius = {outer_radius}\n"
+        f"root_radius  = {root_radius}\n"
+        f"face_width   = {face_width}\n"
+        f"tooth_count  = {tooth_count}\n"
+        f"tooth_depth  = {tooth_depth}\n"
+        f"helix_angle  = {helix_angle}\n"
+        f"hole_radius  = {hole_radius}\n"
+        f"twist_total  = {twist_total}\n"
+        f"num_sections = {num_sections}\n"
+        "\n"
+        "# Generate gear tooth profile points (same as spur gear)\n"
+        "base_points = []\n"
+        "angle_step = 2.0 * math.pi / tooth_count\n"
+        "pitch_r = outer_radius - tooth_depth / 2.0\n"
+        "half_tooth_a = ((2.0 * math.pi * pitch_r / tooth_count) * 0.45) / (2.0 * outer_radius)\n"
+        "\n"
+        "for i in range(tooth_count):\n"
+        "    ac = i * angle_step\n"
+        "    # Root point (between teeth)\n"
+        "    ra = ac - angle_step * 0.45\n"
+        "    base_points.append((root_radius * math.cos(ra), root_radius * math.sin(ra)))\n"
+        "    # Tooth tip left\n"
+        "    base_points.append((outer_radius * math.cos(ac - half_tooth_a), outer_radius * math.sin(ac - half_tooth_a)))\n"
+        "    # Tooth tip right\n"
+        "    base_points.append((outer_radius * math.cos(ac + half_tooth_a), outer_radius * math.sin(ac + half_tooth_a)))\n"
+        "\n"
         "with BuildPart() as b:\n"
-        "    with BuildSketch(Plane.XY):\n"
-        "        Circle(radius=root_radius)\n"
-        "    extrude(amount=thickness)\n"
-        "    with BuildSketch(Plane.XY):\n"
-        "        with PolarLocations(root_radius + tooth_depth * 0.5, tooth_count):\n"
-        "            Rectangle(tooth_depth, tooth_width)\n"
-        "    extrude(amount=thickness, mode=Mode.ADD)\n"
+        "    # Create loft sections: gear profile at each height, rotated progressively\n"
+        "    for sec in range(num_sections + 1):\n"
+        "        t = sec / num_sections\n"
+        "        z = face_width * t\n"
+        "        twist_rad = math.radians(twist_total * t)\n"
+        "        cos_t = math.cos(twist_rad)\n"
+        "        sin_t = math.sin(twist_rad)\n"
+        "        rotated = [(x * cos_t - y * sin_t, x * sin_t + y * cos_t) for x, y in base_points]\n"
+        "        rotated.append(rotated[0])\n"
+        "        with BuildSketch(Plane.XY.offset(z)):\n"
+        "            with BuildLine():\n"
+        "                Polyline(*rotated, close=True)\n"
+        "            make_face()\n"
+        "    loft()\n"
+        "\n"
+        "    # Central bore\n"
+        f"    if {hole_radius} > 0:\n"
+        f"        Hole(radius={hole_radius}, depth=face_width + 1.0)\n"
+        "\n"
         f"export_stl(b.part, '{safe_path}')\n"
     )
 
@@ -779,8 +1043,16 @@ def generate_specialized_code(summary: str, stl_path: str) -> str | None:
     cls = classify_object(summary)
     if cls == "corner_feature_part":
         return generate_corner_feature_part(summary, stl_path)
+    if obj == "sphere":
+        dims = parse_dims(summary)
+        diameter = dims[0] if len(dims) >= 1 else 50.0
+        return make_sphere(diameter, stl_path)
     if obj == "table":
         return generate_table(summary, stl_path)
+    if obj == "bevel_gear" or cls == "bevel_gear":
+        return generate_bevel_gear(summary, stl_path)
+    if obj == "helical_gear" or cls == "helical_gear":
+        return generate_helical_gear(summary, stl_path)
     if obj == "gear" or cls == "gear":
         return generate_gear(summary, stl_path)
     if cls == "hole_part":
@@ -801,10 +1073,28 @@ def generate_fallback(summary: str, stl_path: str) -> str:
 
     print(f"[Fallback] Object='{obj}'  Dims={dims}  Hex={is_hex}")
 
+    # For bevel gear, call dedicated generator
+    if obj == "bevel_gear":
+        code = generate_bevel_gear(summary, safe_path)
+        print("[Fallback] Bevel gear code:\n", code)
+        return execute_code(code, stl_path, summary)
+
+    # For helical gear, call dedicated generator
+    if obj == "helical_gear":
+        code = generate_helical_gear(summary, safe_path)
+        print("[Fallback] Helical gear code:\n", code)
+        return execute_code(code, stl_path, summary)
+
+    # For spur gear, use existing generator
+    if obj == "gear":
+        code = generate_gear(summary, safe_path)
+        print("[Fallback] Gear code:\n", code)
+        return execute_code(code, stl_path, summary)
+
     specialized = generate_specialized_code(summary, safe_path)
     summary_class = classify_object(summary)
     if specialized is not None and (
-        obj in {"table", "gear", "helmet", "frame"}
+        obj in {"table", "gear", "bevel_gear", "helical_gear", "helmet", "frame"}
         or summary_class in {"hole_part", "corner_feature_part"}
     ):
         print("[Fallback] Specialized code:\n", specialized)
@@ -929,9 +1219,6 @@ def generate_fallback(summary: str, stl_path: str) -> str:
     elif obj == "table":
         code = generate_table(summary, safe_path)
 
-    elif obj == "gear":
-        code = generate_gear(summary, safe_path)
-
     elif obj == "helmet":
         code = generate_helmet(summary, safe_path)
 
@@ -976,7 +1263,7 @@ def generate_fallback(summary: str, stl_path: str) -> str:
         shank_d = _extract_labeled_value(summary, [r"Shank\s*Dia(?:meter)?", r"Body\s*Dia(?:meter)?", r"Diameter", r"Dia(?:meter)?"])
         shank_l = _extract_labeled_value(summary, [r"Shank\s*Length", r"Grip\s*Length", r"Length"])
         head_d  = _extract_labeled_value(summary, [r"Head\s*Dia(?:meter)?"])
-        head_h  = _extract_labeled_value(summary, [r"Head\s*Height", r"Head\s*Thickness"])
+        head_h  = _extract_labeled_value(summary, [r"Head\s+Height", r"Head\s+Thickness"])
 
         if shank_d is None and dims:
             shank_d = dims[0]
@@ -1193,6 +1480,25 @@ def build_direct_summary(user_message: str) -> str | None:
             f"- Dimensions: Shank Dia={shank_d:.3g}mm, Shank Length={shank_l:.3g}mm, Head Dia={head_d:.3g}mm, Head Height={head_h:.3g}mm\n"
             f"- Shape: Button Head\n"
             f"- Features: None\n"
+            "Now the design process will be started."
+        )
+
+    if obj == "helical_gear":
+        if len(dims) < 2:
+            return None
+        outer_dia   = _extract_labeled_value(text, [r"Outer\s*Dia(?:meter)?", r"Diameter"]) or (dims[0] if len(dims) >= 1 else 60.0)
+        face_width  = _extract_labeled_value(text, [r"Face\s*Width", r"Width", r"Thickness"]) or (dims[1] if len(dims) >= 2 else 15.0)
+        tooth_count = _extract_labeled_value(text, [r"Tooth\s*Count", r"Teeth", r"Number\s*of\s*Teeth"]) or (dims[2] if len(dims) >= 3 else 20)
+        helix_angle = _extract_labeled_value(text, [r"Helix\s*Angle", r"Helical\s*Angle", r"Angle"]) or (dims[3] if len(dims) >= 4 else 25.0)
+        hole_dia    = _extract_labeled_value(text, [r"Central\s*hole", r"Hole\s*Dia(?:meter)?", r"Bore\s*Dia(?:meter)?"]) or (dims[4] if len(dims) >= 5 else 12.0)
+        tooth_count = int(round(float(tooth_count)))
+        return (
+            "All required parameters collected.\n"
+            "Summary:\n"
+            f"- Object: Helical Gear\n"
+            f"- Dimensions: Outer Diameter={outer_dia}mm, Face Width={face_width}mm, Tooth Count={tooth_count}, Helix Angle={helix_angle}deg, Hole Diameter={hole_dia}mm\n"
+            f"- Shape: Helical Gear\n"
+            f"- Features: Helical Teeth / Central Bore\n"
             "Now the design process will be started."
         )
 
@@ -1524,7 +1830,7 @@ def validate(summary: str, code: str) -> str:
         if extrude_count < 1:
             return "thread_replaces_shaft"
 
-    if "gear" in s and "polarlocations" not in code_lower:
+    if "gear" in s and "helical" not in s and "polarlocations" not in code_lower:
         return "missing_gear_pattern"
 
     # Hole-pattern validation only triggers for explicit hole-pattern requests.
@@ -1908,9 +2214,10 @@ def run_pipeline(summary: str):
     if initial_code is not None and (
         detected_obj == "table"
         or classified_obj == "gear"
+        or classified_obj == "helical_gear"
         or classified_obj == "hole_part"
         or classified_obj == "corner_feature_part"
-        or detected_obj in {"gear", "helmet", "frame"}
+        or detected_obj in {"gear", "helmet", "frame", "bevel_gear", "helical_gear"}
         or classified_obj == "organic"
     ):
         code = patch_export(initial_code, STL_PATH)
@@ -1996,4 +2303,3 @@ def run_pipeline(summary: str):
         print(f"[Fallback] Failed: {e}\n{traceback.format_exc()}")
 
     return None
-
