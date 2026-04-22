@@ -16,6 +16,10 @@ from Modelling import (
 )
 from Sim import find_failure, run_simulation, sim_state
 
+# NEW: Image‑to‑Model parser
+from image_parser import build_summary_from_image, refine_summary_with_user_input
+
+
 def chat_handler(user_message, history):
     direct_summary = build_direct_summary(user_message)
     detected_obj = detect_object(user_message)
@@ -194,7 +198,7 @@ def create_ui():
             with gr.Tabs():
 
                 # ════════════════════════════════════════════════════════════
-                # TAB 1 — MODELLING (unchanged from modelling.py)
+                # TAB 1 — MODELLING (text chat)
                 # ════════════════════════════════════════════════════════════
                 with gr.TabItem("🔧 3D Modelling"):
                     gr.Markdown("Describe your component in natural language.")
@@ -242,7 +246,67 @@ def create_ui():
                     )
 
                 # ════════════════════════════════════════════════════════════
-                # TAB 2 — SIMULATION (from ok.py — simulation_final.txt, unchanged)
+                # TAB 2 — IMAGE TO MODEL (NEW)
+                # ════════════════════════════════════════════════════════════
+                with gr.TabItem("📸 Image to Model"):
+                    gr.Markdown("Upload an engineering drawing or sketch – the AI will extract dimensions and create a 3D model.")
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            image_input = gr.Image(type="filepath", label="Upload Image", elem_id="image-upload")
+                            extract_btn = gr.Button("🔍 Extract Data", variant="primary")
+                        with gr.Column(scale=2):
+                            extracted_text = gr.Textbox(label="Extracted Text (OCR)", lines=6, interactive=False)
+                            detected_obj = gr.Textbox(label="Detected Object", interactive=False)
+                            with gr.Group():
+                                gr.Markdown("### ✏️ Edit Dimensions (optional)")
+                                dims_editor = gr.Textbox(label="Dimensions (key=value, comma separated)", lines=2,
+                                                         placeholder="e.g. Diameter=20, Length=30, Tooth Count=18")
+                            generate_btn = gr.Button("🚀 Generate 3D Model", variant="primary", visible=False)
+                            model_viewer_img = gr.Model3D(label="Generated Model", elem_id="model-viewer", height=400)
+
+                    # State to hold the raw summary
+                    raw_summary_state = gr.State("")
+
+                    def on_extract(image_path):
+                        if not image_path:
+                            return "", "", "", "", None
+                        try:
+                            summary, obj, dims = build_summary_from_image(image_path)
+                            # Prepare display text
+                            dims_display = ", ".join([f"{k}={v}" for k, v in dims.items() if k not in ["raw_numbers"]])
+                            return summary, obj, dims_display, summary, gr.update(visible=True)
+                        except Exception as e:
+                            return f"Error: {str(e)}", "unknown", "", "", gr.update(visible=False)
+
+                    extract_btn.click(
+                        on_extract,
+                        inputs=[image_input],
+                        outputs=[extracted_text, detected_obj, dims_editor, raw_summary_state, generate_btn]
+                    )
+
+                    def on_generate_with_edits(summary, edits_str):
+                        # Parse edits from comma‑separated string
+                        edits = {}
+                        if edits_str:
+                            for part in edits_str.split(','):
+                                if '=' in part:
+                                    k, v = part.split('=', 1)
+                                    edits[k.strip()] = v.strip()
+                        final_summary = refine_summary_with_user_input(summary, edits)
+                        # Use existing run_pipeline
+                        from Modelling import run_pipeline, prepare_viewer_model
+                        stl_path = run_pipeline(final_summary)
+                        viewer_path = prepare_viewer_model(stl_path) if stl_path else None
+                        return viewer_path
+
+                    generate_btn.click(
+                        on_generate_with_edits,
+                        inputs=[raw_summary_state, dims_editor],
+                        outputs=[model_viewer_img]
+                    )
+
+                # ════════════════════════════════════════════════════════════
+                # TAB 3 — SIMULATION LAB
                 # ════════════════════════════════════════════════════════════
                 with gr.TabItem("⚡ Simulation Lab"):
                     gr.Markdown("## ⚡ Simulation Lab")
