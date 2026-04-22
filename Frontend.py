@@ -3,6 +3,7 @@ import traceback
 
 import gradio as gr
 
+from ml import _predict_from_ml_models
 from Modelling import (
     COLLECTOR_MAX_TOKENS,
     INTRO_SYSTEM,
@@ -14,10 +15,68 @@ from Modelling import (
     prepare_viewer_model,
     run_pipeline,
 )
-from Sim import find_failure, run_simulation, sim_state
+from Sim import find_failure, generate_simulation_report_pdf, run_simulation, sim_state
 
 # NEW: Image‑to‑Model parser
 from image_parser import build_summary_from_image, refine_summary_with_user_input
+
+
+def run_simulation_with_ml(component_type, temperature, load, load_type, deform_scale):
+    """Run simulation and expose all ML target values in simulation tab."""
+    sim_result = run_simulation(component_type, temperature, load, load_type, deform_scale)
+    try:
+        ml_targets = _predict_from_ml_models(load, temperature, component_type)
+        material_display = f"{ml_targets['material_label']} ({ml_targets['material_key']})"
+        return (
+            *sim_result,
+            material_display,
+            float(ml_targets["stress_ratio"]),
+            str(ml_targets["manufacturing_method"]),
+            float(ml_targets["estimation_cost"]),
+        )
+    except Exception as e:
+        report_fallback = str(sim_result[8]) if len(sim_result) > 8 else ""
+        report_msg = f"{report_fallback}\n\n⚠️ ML values unavailable: {str(e)}".strip()
+        safe_sim_result = list(sim_result)
+        if len(safe_sim_result) > 8:
+            safe_sim_result[8] = report_msg
+        return (*safe_sim_result, "N/A", 0.0, "N/A", 0.0)
+
+
+def find_failure_with_full_update(component_type, temperature, load, load_type, deform_scale):
+    """Find failure safely and refresh all simulation outputs."""
+    fail_result = find_failure(component_type, temperature, load, load_type, deform_scale)
+    failure_load = float(fail_result[0])
+    clamped_load = min(10000.0, max(100.0, failure_load))
+
+    full_sim = list(run_simulation_with_ml(component_type, temperature, clamped_load, load_type, deform_scale))
+    full_sim[0] = fail_result[1]   # Safety factor from failure search
+    full_sim[1] = fail_result[2]   # Stress from failure search
+    full_sim[4] = fail_result[5]   # Failure curve
+    full_sim[8] = fail_result[3]   # Failure report text
+    full_sim[9] = fail_result[4]   # Failure alert panel
+
+    if failure_load != clamped_load:
+        full_sim[8] = (
+            f"{full_sim[8]}\n\n"
+            "ℹ️ Failure point exceeded UI range. Showing maximum supported load: 10000 N."
+        )
+
+    return (clamped_load, *full_sim)
+
+
+def download_simulation_report(component_type, temperature, load, load_type, deform_scale):
+    """Generate downloadable simulation PDF report from current settings."""
+    try:
+        return generate_simulation_report_pdf(
+            component_type=component_type,
+            temperature=temperature,
+            load=load,
+            load_type=load_type,
+            deform_scale=deform_scale,
+        )
+    except Exception:
+        return None
 
 
 def chat_handler(user_message, history):
@@ -332,6 +391,12 @@ def create_ui():
 
                                 gr.Markdown("### ⚡ Load")
                                 sim_load = gr.Slider(100, 10000, value=500, step=100, label="Applied Load (N)")
+                                sim_load_type = gr.Dropdown(
+                                    choices=["Tensile", "Torsion", "Compressive"],
+                                    value="Tensile",
+                                    label="Load Type"
+                                )
+                                sim_deform_scale = gr.Slider(0.2, 5.0, value=1.0, step=0.1, label="Deformation Scale")
 
                                 with gr.Row():
                                     run_sim_btn  = gr.Button("▶️ Run Sim", variant="primary")
@@ -345,6 +410,13 @@ def create_ui():
                                 with gr.Row():
                                     deform_metric = gr.Number(label="Strain", value=0)
                                     mass_metric   = gr.Number(label="Yield Point (MPa)", value=0)
+                                ml_material = gr.Textbox(label="Material", value="N/A", interactive=False)
+                                with gr.Row():
+                                    ml_stress_ratio = gr.Number(label="Stress Ratio", value=0)
+                                    ml_cost = gr.Number(label="Estimated Cost", value=0)
+                                ml_method = gr.Textbox(label="Manufacturing Method", value="N/A", interactive=False)
+                                report_btn = gr.Button("📄 Download Report", variant="secondary")
+                                report_file = gr.File(label="Simulation Report (PDF)")
 
                         # ── Visualizations ────────────────────────────────────
                         with gr.Column(scale=2):
@@ -360,6 +432,10 @@ def create_ui():
                                 """)
 
                             with gr.Group(elem_classes=["panel"]):
+                                gr.Markdown("### 🧊 3D Interactive Simulation")
+                                interactive_plot = gr.HTML()
+
+                            with gr.Group(elem_classes=["panel"]):
                                 gr.Markdown("### 📈 Response Curves")
                                 with gr.Tabs():
                                     with gr.TabItem("Safety Factor"):
@@ -373,13 +449,7 @@ def create_ui():
                                 gr.Markdown("### 🤖 AI Analysis")
                                 compliance_gauge = gr.Plot()
 
-                                with gr.Group(visible=False) as failure_panel:
-                                    gr.HTML("""
-                                    <div class="failure-alert">
-                                        <h3 style="color:#ef4444;margin-top:0;">⚠️ FAILURE PREDICTED</h3>
-                                        <p>Reduce load or upgrade material.</p>
-                                    </div>
-                                    """)
+                                failure_panel = gr.HTML(visible=False)
 
                                 ai_report = gr.Markdown()
 
@@ -387,26 +457,33 @@ def create_ui():
                     sim_outputs = [
                         sf_metric, stress_metric, deform_metric, mass_metric,
                         sf_curve, deform_curve, heatmap_plot, compliance_gauge,
-                        ai_report, failure_panel
+                        ai_report, failure_panel, interactive_plot,
+                        ml_material, ml_stress_ratio, ml_method, ml_cost,
                     ]
 
                     run_sim_btn.click(
-                        fn=run_simulation,
-                        inputs=[sim_component, sim_temperature, sim_load],
+                        fn=run_simulation_with_ml,
+                        inputs=[sim_component, sim_temperature, sim_load, sim_load_type, sim_deform_scale],
                         outputs=sim_outputs
                     )
 
                     find_fail_btn.click(
-                        fn=find_failure,
-                        inputs=[sim_component, sim_temperature, sim_load],
-                        outputs=[sim_load, sf_metric, stress_metric, ai_report, failure_panel, sf_curve]
+                        fn=find_failure_with_full_update,
+                        inputs=[sim_component, sim_temperature, sim_load, sim_load_type, sim_deform_scale],
+                        outputs=[sim_load, *sim_outputs]
+                    )
+
+                    report_btn.click(
+                        fn=download_simulation_report,
+                        inputs=[sim_component, sim_temperature, sim_load, sim_load_type, sim_deform_scale],
+                        outputs=[report_file],
                     )
 
                     # Live slider updates
-                    for component in [sim_component, sim_temperature, sim_load]:
+                    for component in [sim_component, sim_temperature, sim_load, sim_load_type, sim_deform_scale]:
                         component.change(
-                            fn=run_simulation,
-                            inputs=[sim_component, sim_temperature, sim_load],
+                            fn=run_simulation_with_ml,
+                            inputs=[sim_component, sim_temperature, sim_load, sim_load_type, sim_deform_scale],
                             outputs=sim_outputs
                         )
 

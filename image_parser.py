@@ -1,8 +1,4 @@
-"""
-Image‑to‑Model parser: OCR + dimension extraction → engineering summary.
-Strict per‑object parameter filtering – no extra/zero/invalid values.
-Now fail‑safe: uses default dimensions when OCR fails.
-"""
+
 import re
 from typing import Dict, List, Optional, Tuple, Any
 import cv2
