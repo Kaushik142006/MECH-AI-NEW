@@ -597,7 +597,7 @@ def run_simulation(component_type: str, temperature: float, load: float,
     """Integrated simulation pipeline."""
     try:
         print("\n" + "=" * 50)
-        print(f"[MECHAI] SIMULATION START: {component_type} | Load={load}N | Temp={temperature}Â°C")
+        print(f"[MECHAI] SIMULATION START: {component_type} | Load={load}N | Temp={temperature}°C")
         print("=" * 50)
         
         # Access the globally tracked STL_PATH
@@ -1007,7 +1007,7 @@ def _generate_heatmap_plot(
             sc = ax.scatter(px, py, c=stresses, cmap='turbo', s=10, alpha=0.7, vmin=0.0, vmax=vmax)
             fig.colorbar(sc, ax=ax, label="Stress (MPa)")
 
-    ax.set_title(f"Structural Stress Heatmap ({temperature}Â°C)", color='white', fontsize=12, fontweight='bold')
+    ax.set_title(f"Structural Stress Heatmap ({temperature}°C)", color='white', fontsize=12, fontweight='bold')
     ax.tick_params(colors='#8899aa')
     for spine in ax.spines.values():
         spine.set_color('#2a3a4a')
@@ -1218,6 +1218,9 @@ button:hover {{ border-color:#22d3a0 !important; color:#22d3a0 !important; }}
     <button id="{uid}_play" style="padding:8px 12px;border-radius:10px;border:1px solid #2a3a4a;background:#0f1319;color:#e0e8f0;font-weight:700;cursor:pointer;">
       Run 4s Animation
     </button>
+    <button id="{uid}_pause" style="padding:8px 12px;border-radius:10px;border:1px solid #2a3a4a;background:#0f1319;color:#e0e8f0;font-weight:700;cursor:pointer;">
+      Pause
+    </button>
     <button id="{uid}_reset" style="padding:8px 12px;border-radius:10px;border:1px solid #2a3a4a;background:#0f1319;color:#e0e8f0;font-weight:700;cursor:pointer;">
       Reset
     </button>
@@ -1231,6 +1234,10 @@ button:hover {{ border-color:#22d3a0 !important; color:#22d3a0 !important; }}
   const pctEl = document.getElementById("{uid}_pct");
   const overlay = document.getElementById("{uid}_overlay");
   let graphDiv = null;
+  let animationId = null;
+  let animationStart = 0;
+  let pausedElapsed = 0;
+  let isPaused = false;
 
   function smoothstep(t) {{ return t * t * (3 - 2 * t); }}
   function clamp01(x) {{ return Math.max(0, Math.min(1, x)); }}
@@ -1283,14 +1290,30 @@ button:hover {{ border-color:#22d3a0 !important; color:#22d3a0 !important; }}
   }}
 
   function startAnimation() {{
-    const start = performance.now();
+    if (animationId) cancelAnimationFrame(animationId);
+    animationStart = performance.now();
+    pausedElapsed = 0;
+    isPaused = false;
     const duration = 4000;
     function step(now) {{
-      const t = Math.min(1, (now - start) / duration);
+      if (isPaused) return;
+      pausedElapsed = now - animationStart;
+      const t = Math.min(1, pausedElapsed / duration);
       renderAt(t);
-      if (t < 1) requestAnimationFrame(step);
+      if (t < 1) {{
+        animationId = requestAnimationFrame(step);
+      }} else {{
+        animationId = null;
+      }}
     }}
-    requestAnimationFrame(step);
+    animationId = requestAnimationFrame(step);
+  }}
+
+  function pauseAnimation() {{
+    if (!animationId) return;
+    isPaused = true;
+    cancelAnimationFrame(animationId);
+    animationId = null;
   }}
 
   ensurePlotly(() => {{
@@ -1350,9 +1373,17 @@ button:hover {{ border-color:#22d3a0 !important; color:#22d3a0 !important; }}
     }}
 
     const playBtn = document.getElementById("{uid}_play");
+    const pauseBtn = document.getElementById("{uid}_pause");
     const resetBtn = document.getElementById("{uid}_reset");
     if (playBtn) playBtn.onclick = startAnimation;
-    if (resetBtn) resetBtn.onclick = () => renderAt(0);
+    if (pauseBtn) pauseBtn.onclick = pauseAnimation;
+    if (resetBtn) resetBtn.onclick = () => {{
+      if (animationId) cancelAnimationFrame(animationId);
+      animationId = null;
+      isPaused = false;
+      pausedElapsed = 0;
+      renderAt(0);
+    }};
 
     // Autoplay on render to match the requested workflow.
     startAnimation();
@@ -1539,7 +1570,7 @@ def _generate_ai_report(predictions, load, temperature, load_type, deform_scale)
     report += f"**Material:** {material} (Yield: {yield_mpa:.0f} MPa)\n"
     report += f"**Load Configuration:** {load_type} at {load} N\n"
     report += f"**Deformation Scale:** {deform_scale}x (visualization)\n"
-    report += f"**Operating Temperature:** {temperature}Â°C\n\n"
+    report += f"**Operating Temperature:** {temperature}°C\n\n"
     
     report += f"### Results\n"
     report += f"- **Safety Factor:** `{safety:.2f}`\n"
@@ -1547,10 +1578,10 @@ def _generate_ai_report(predictions, load, temperature, load_type, deform_scale)
     report += f"- **Strain:** `{strain:.6f}`\n\n"
     
     if safety >= 2.0:
-        report += "âœ… **Design is safe** with excellent safety margin. No action required.\n"
+        report += "**Design is safe** with excellent safety margin. No action required.\n"
         report += f"- Can withstand up to ~{int(load * safety)} N before reaching yield.\n"
     elif safety >= 1.5:
-        report += "âœ“ **Design is acceptable** with adequate safety margin for static loads.\n"
+        report += "**Design is acceptable** with adequate safety margin for static loads.\n"
         report += "- Consider increasing margin for cyclic/dynamic loading.\n"
     elif safety >= 1.0:
         report += "**Design meets minimum requirements** but has low safety margin.\n"
