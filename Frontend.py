@@ -96,7 +96,7 @@ def chat_handler(user_message, history):
             # Update sim state with the detected object for simulation tab
             sim_state.last_detected_object = detected_obj if detected_obj != "unknown" else sim_state.last_detected_object
             sim_state.last_dims = parse_dims(pipeline_input)
-            bot_reply += "\n\n**3D model generated!** Check the viewer â†’" if stl_file \
+            bot_reply += "\n\n**3D model generated!** Check the viewer" if stl_file \
                          else "\n\nâš ï¸ Generation failed. Please try again."
         except Exception as e:
             print(traceback.format_exc())
@@ -129,7 +129,7 @@ def chat_handler(user_message, history):
             detected = detect_object(bot_reply)
             sim_state.last_detected_object = detected if detected != "unknown" else sim_state.last_detected_object
             sim_state.last_dims = parse_dims(bot_reply)
-            bot_reply += "\n\n**3D model generated!** Check the viewer â†’" if stl_file \
+            bot_reply += "\n\n**3D model generated!** Check the viewer" if stl_file \
                          else "\n\n**Generation failed. Please try again.**"
         except Exception as e:
             print(traceback.format_exc())
@@ -320,7 +320,7 @@ def create_ui():
                                 gr.Markdown("Edit Dimensions (optional)")
                                 dims_editor = gr.Textbox(label="Dimensions (key=value, comma separated)", lines=2,
                                                          placeholder="e.g. Diameter=20, Length=30, Tooth Count=18")
-                            generate_btn = gr.Button("ðŸš€ Generate 3D Model", variant="primary", visible=False)
+                            generate_btn = gr.Button("Generate 3D  Model", variant="primary", visible=False)
                             model_viewer_img = gr.Model3D(label="Generated Model", elem_id="model-viewer", height=400)
 
                     # State to hold the raw summary
