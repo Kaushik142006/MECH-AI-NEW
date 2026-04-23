@@ -1,4 +1,4 @@
-"""Gradio UI and chat handler."""
+﻿"""Gradio UI and chat handler."""
 import traceback
 
 import gradio as gr
@@ -17,7 +17,7 @@ from Modelling import (
 )
 from Sim import find_failure, generate_simulation_report_pdf, run_simulation, sim_state
 
-# NEW: Image‑to‑Model parser
+# NEW: Imageâ€‘toâ€‘Model parser
 from image_parser import build_summary_from_image, refine_summary_with_user_input
 
 
@@ -36,7 +36,7 @@ def run_simulation_with_ml(component_type, temperature, load, load_type, deform_
         )
     except Exception as e:
         report_fallback = str(sim_result[8]) if len(sim_result) > 8 else ""
-        report_msg = f"{report_fallback}\n\n⚠️ ML values unavailable: {str(e)}".strip()
+        report_msg = f"{report_fallback}\n\nML values unavailable: {str(e)}".strip()
         safe_sim_result = list(sim_result)
         if len(safe_sim_result) > 8:
             safe_sim_result[8] = report_msg
@@ -59,7 +59,7 @@ def find_failure_with_full_update(component_type, temperature, load, load_type, 
     if failure_load != clamped_load:
         full_sim[8] = (
             f"{full_sim[8]}\n\n"
-            "ℹ️ Failure point exceeded UI range. Showing maximum supported load: 10000 N."
+            "Failure point exceeded UI range. Showing maximum supported load: 10000 N."
         )
 
     return (clamped_load, *full_sim)
@@ -96,11 +96,11 @@ def chat_handler(user_message, history):
             # Update sim state with the detected object for simulation tab
             sim_state.last_detected_object = detected_obj if detected_obj != "unknown" else sim_state.last_detected_object
             sim_state.last_dims = parse_dims(pipeline_input)
-            bot_reply += "\n\n✅ **3D model generated!** Check the viewer →" if stl_file \
-                         else "\n\n⚠️ Generation failed. Please try again."
+            bot_reply += "\n\n**3D model generated!** Check the viewer â†’" if stl_file \
+                         else "\n\nâš ï¸ Generation failed. Please try again."
         except Exception as e:
             print(traceback.format_exc())
-            bot_reply += f"\n\n⚠️ Error: {str(e)}"
+            bot_reply += f"\n\nError: {str(e)}"
 
         history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": bot_reply})
@@ -129,11 +129,11 @@ def chat_handler(user_message, history):
             detected = detect_object(bot_reply)
             sim_state.last_detected_object = detected if detected != "unknown" else sim_state.last_detected_object
             sim_state.last_dims = parse_dims(bot_reply)
-            bot_reply += "\n\n✅ **3D model generated!** Check the viewer →" if stl_file \
-                         else "\n\n⚠️ Generation failed. Please try again."
+            bot_reply += "\n\n**3D model generated!** Check the viewer â†’" if stl_file \
+                         else "\n\n**Generation failed. Please try again.**"
         except Exception as e:
             print(traceback.format_exc())
-            bot_reply += f"\n\n⚠️ Error: {str(e)}"
+            bot_reply += f"\n\n**Error: {str(e)}**"
 
     history.append({"role": "user",      "content": user_message})
     history.append({"role": "assistant", "content": bot_reply})
@@ -181,7 +181,7 @@ label,#label-text{color:#8899aa !important;font-family:monospace !important;text
 def create_ui():
     with gr.Blocks(
         css=CUSTOM_CSS,
-        title="MECH-AI — Modelling + Simulation",
+        title="MECH-AI â€” Modelling + Simulation",
         theme=gr.themes.Base(
             primary_hue=gr.themes.colors.green,
             secondary_hue=gr.themes.colors.gray,
@@ -245,7 +245,7 @@ def create_ui():
             start_btn = gr.Button("Start Building", elem_id="start-building-btn", variant="primary")
 
         with gr.Group(visible=True) as main_view:
-            # ── Header ──────────────────────────────────────────────────────
+            # â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             gr.HTML("""
             <div id="header">
                 <h1>MEC<span style="color:#3b82f6">H</span>-AI</h1>
@@ -253,13 +253,13 @@ def create_ui():
             </div>
             """)
 
-            # ── Tab navigation ───────────────────────────────────────────────
+            # â”€â”€ Tab navigation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             with gr.Tabs():
 
-                # ════════════════════════════════════════════════════════════
-                # TAB 1 — MODELLING (text chat)
-                # ════════════════════════════════════════════════════════════
-                with gr.TabItem("🔧 3D Modelling"):
+                # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+                # TAB 1 â€” MODELLING (text chat)
+                # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+                with gr.TabItem("3D Modelling"):
                     gr.Markdown("Describe your component in natural language.")
 
                     with gr.Row():
@@ -274,11 +274,11 @@ def create_ui():
                                     placeholder="e.g. 'M6 screw, 30mm long' or 'hex nut inner 10mm outer 20mm thick 8mm'",
                                     show_label=False, elem_id="user-input", scale=5, lines=1, max_lines=3,
                                 )
-                                send_btn = gr.Button("Send ➤", elem_id="send-btn", scale=1, variant="primary")
-                            clear_btn = gr.Button("🔄 New Design", size="sm")
+                                send_btn = gr.Button("Send", elem_id="send-btn", scale=1, variant="primary")
+                            clear_btn = gr.Button("New Design", size="sm")
 
                         with gr.Column(scale=2):
-                            gr.Markdown("#### 🎯 3D Model Viewer")
+                            gr.Markdown("3D Model Viewer")
                             model_viewer = gr.Model3D(
                                 label="Generated Model", elem_id="model-viewer",
                                 height=480, clear_color=[0.059, 0.075, 0.098, 1.0],
@@ -304,23 +304,23 @@ def create_ui():
                         outputs=[chatbot, model_viewer],
                     )
 
-                # ════════════════════════════════════════════════════════════
-                # TAB 2 — IMAGE TO MODEL (NEW)
-                # ════════════════════════════════════════════════════════════
-                with gr.TabItem("📸 Image to Model"):
-                    gr.Markdown("Upload an engineering drawing or sketch – the AI will extract dimensions and create a 3D model.")
+                # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+                # TAB 2 â€” IMAGE TO MODEL (NEW)
+                # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+                with gr.TabItem("Image to Model"):
+                    gr.Markdown("Upload an engineering drawing or sketch the AI will extract dimensions and create a 3D model.")
                     with gr.Row():
                         with gr.Column(scale=1):
                             image_input = gr.Image(type="filepath", label="Upload Image", elem_id="image-upload")
-                            extract_btn = gr.Button("🔍 Extract Data", variant="primary")
+                            extract_btn = gr.Button("Extract Data", variant="primary")
                         with gr.Column(scale=2):
                             extracted_text = gr.Textbox(label="Extracted Text (OCR)", lines=6, interactive=False)
                             detected_obj = gr.Textbox(label="Detected Object", interactive=False)
                             with gr.Group():
-                                gr.Markdown("### ✏️ Edit Dimensions (optional)")
+                                gr.Markdown("Edit Dimensions (optional)")
                                 dims_editor = gr.Textbox(label="Dimensions (key=value, comma separated)", lines=2,
                                                          placeholder="e.g. Diameter=20, Length=30, Tooth Count=18")
-                            generate_btn = gr.Button("🚀 Generate 3D Model", variant="primary", visible=False)
+                            generate_btn = gr.Button("ðŸš€ Generate 3D Model", variant="primary", visible=False)
                             model_viewer_img = gr.Model3D(label="Generated Model", elem_id="model-viewer", height=400)
 
                     # State to hold the raw summary
@@ -344,7 +344,7 @@ def create_ui():
                     )
 
                     def on_generate_with_edits(summary, edits_str):
-                        # Parse edits from comma‑separated string
+                        # Parse edits from commaâ€‘separated string
                         edits = {}
                         if edits_str:
                             for part in edits_str.split(','):
@@ -364,18 +364,18 @@ def create_ui():
                         outputs=[model_viewer_img]
                     )
 
-                # ════════════════════════════════════════════════════════════
-                # TAB 3 — SIMULATION LAB
-                # ════════════════════════════════════════════════════════════
-                with gr.TabItem("⚡ Simulation Lab"):
-                    gr.Markdown("## ⚡ Simulation Lab")
+                # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+                # TAB 3 â€” SIMULATION LAB
+                # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+                with gr.TabItem("Simulation Lab"):
+                    gr.Markdown("## Simulation Lab")
                     gr.Markdown("Real-time FEA with AI-driven optimization. Uses the last modelled object automatically, or adjust parameters manually.")
 
                     with gr.Row():
-                        # ── Controls ─────────────────────────────────────────
+                        # Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                         with gr.Column(scale=1):
                             with gr.Group(elem_classes=["panel"]):
-                                gr.Markdown("### 🎛️ Parameters")
+                                gr.Markdown("### Parameters")
 
                                 sim_component = gr.Dropdown(
                                     choices=[
@@ -389,7 +389,7 @@ def create_ui():
                                 )
                                 sim_temperature = gr.Slider(-50, 400, value=25, step=1, label="Temperature (°C)")
 
-                                gr.Markdown("### ⚡ Load")
+                                gr.Markdown("### Load")
                                 sim_load = gr.Slider(100, 10000, value=500, step=100, label="Applied Load (N)")
                                 sim_load_type = gr.Dropdown(
                                     choices=["Tensile", "Torsion", "Compressive"],
@@ -399,11 +399,11 @@ def create_ui():
                                 sim_deform_scale = gr.Slider(0.2, 5.0, value=1.0, step=0.1, label="Deformation Scale")
 
                                 with gr.Row():
-                                    run_sim_btn  = gr.Button("▶️ Run Sim", variant="primary")
-                                    find_fail_btn = gr.Button("💥 Find Failure", variant="stop")
+                                    run_sim_btn  = gr.Button("Run Sim", variant="primary")
+                                    find_fail_btn = gr.Button("Find Failure", variant="stop")
 
                             with gr.Group(elem_classes=["panel"]):
-                                gr.Markdown("### 📊 Metrics")
+                                gr.Markdown("### Metrics")
                                 with gr.Row():
                                     sf_metric     = gr.Number(label="Safety Factor", value=2.0)
                                     stress_metric = gr.Number(label="Stress (MPa)", value=0)
@@ -415,13 +415,13 @@ def create_ui():
                                     ml_stress_ratio = gr.Number(label="Stress Ratio", value=0)
                                     ml_cost = gr.Number(label="Estimated Cost", value=0)
                                 ml_method = gr.Textbox(label="Manufacturing Method", value="N/A", interactive=False)
-                                report_btn = gr.Button("📄 Download Report", variant="secondary")
+                                report_btn = gr.Button("Download Report", variant="secondary")
                                 report_file = gr.File(label="Simulation Report (PDF)")
 
-                        # ── Visualizations ────────────────────────────────────
+                        # â”€â”€ Visualizations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                         with gr.Column(scale=2):
                             with gr.Group(elem_classes=["panel"]):
-                                gr.Markdown("### 🌡️ 3D Stress Heatmap")
+                                gr.Markdown("### 3D Stress Heatmap")
                                 heatmap_plot = gr.Plot()
                                 gr.HTML("""
                                 <div style="display:flex;align-items:center;gap:10px;margin-top:8px;">
@@ -432,28 +432,28 @@ def create_ui():
                                 """)
 
                             with gr.Group(elem_classes=["panel"]):
-                                gr.Markdown("### 🧊 3D Interactive Simulation")
+                                gr.Markdown("### 3D Interactive Simulation")
                                 interactive_plot = gr.HTML()
 
                             with gr.Group(elem_classes=["panel"]):
-                                gr.Markdown("### 📈 Response Curves")
+                                gr.Markdown("### Response Curves")
                                 with gr.Tabs():
                                     with gr.TabItem("Safety Factor"):
                                         sf_curve = gr.Plot()
                                     with gr.TabItem("Strain"):
                                         deform_curve = gr.Plot()
 
-                        # ── AI Analysis ───────────────────────────────────────
+                        # â”€â”€ AI Analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                         with gr.Column(scale=1):
                             with gr.Group(elem_classes=["panel"]):
-                                gr.Markdown("### 🤖 AI Analysis")
+                                gr.Markdown("### AI Analysis")
                                 compliance_gauge = gr.Plot()
 
                                 failure_panel = gr.HTML(visible=False)
 
                                 ai_report = gr.Markdown()
 
-                    # ── Simulation Events ────────────────────────────────────
+                    # â”€â”€ Simulation Events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     sim_outputs = [
                         sf_metric, stress_metric, deform_metric, mass_metric,
                         sf_curve, deform_curve, heatmap_plot, compliance_gauge,
@@ -492,3 +492,6 @@ def create_ui():
         # Landing flow disabled in app; use external index.html as entry page.
 
     return app
+
+
+

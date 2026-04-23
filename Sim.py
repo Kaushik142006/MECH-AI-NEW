@@ -3,6 +3,7 @@ import html
 import json
 import re
 import tempfile
+import textwrap
 import time
 from datetime import datetime
 import numpy as np
@@ -1611,12 +1612,11 @@ def generate_simulation_report_pdf(
     deform_scale: float = 1.0,
     stl_path: str = None,
 ) -> str:
-    """Generate a professional simulation report as a PDF file."""
+    """Generate a polished simulation report as a PDF file."""
     print(f"[Sim] Starting PDF Report generation for {component_type}...")
     try:
-        # Close any lingering figures from other threads
-        plt.close('all') 
-        
+        plt.close("all")
+
         print("[Sim] Running simulation for report data...")
         result = run_simulation(
             component_type=component_type,
@@ -1625,67 +1625,93 @@ def generate_simulation_report_pdf(
             load_type=load_type,
             deform_scale=deform_scale,
         )
-        
-        # Unpack results safely
         (
             safety_factor, stress_mpa, strain, yield_mpa,
             sf_curve, deform_curve, heatmap_plot, compliance_gauge,
             ai_report, _failure_panel, _video
         ) = result
 
-        print("[Sim] Formatting report text...")
         report_text = re.sub(r"[*`#_>-]", "", str(ai_report))
         report_text = report_text.encode("ascii", "ignore").decode("ascii")
-        report_text = report_text.replace("\n\n", "\n")
-        report_lines = [line.strip() for line in report_text.splitlines() if line.strip()]
-        report_lines = [ln.replace("AI Analysis Report", "AI Analysis").strip("- ").strip() for ln in report_lines]
+        report_text = report_text.replace("AI Analysis Report", "AI Analysis")
+        report_lines = [line.strip(" -") for line in report_text.splitlines() if line.strip()]
 
         fd, pdf_path = tempfile.mkstemp(prefix="mechai_report_", suffix=".pdf")
         os.close(fd)
 
-        print(f"[Sim] Writing PDF to {pdf_path}...")
+        def footer(fig):
+            fig.text(0.5, 0.025, "Made by MECH-AI", ha="center", va="center", fontsize=9, color="#617080", fontweight="bold")
+            fig.text(0.88, 0.025, datetime.now().strftime("%Y-%m-%d %H:%M"), ha="right", va="center", fontsize=8, color="#8a96a3")
+
+        def card(ax, x, y, w, h, title, lines, accent="#22d3a0"):
+            ax.add_patch(plt.Rectangle((x, y - h), w, h, transform=ax.transAxes, facecolor="#f7fafc", edgecolor="#d5dee8", linewidth=1.0))
+            ax.add_patch(plt.Rectangle((x, y - 0.035), w, 0.035, transform=ax.transAxes, facecolor=accent, edgecolor=accent, linewidth=0))
+            ax.text(x + 0.018, y - 0.024, title.upper(), transform=ax.transAxes, fontsize=9, fontweight="bold", color="#ffffff", va="center")
+            cy = y - 0.065
+            for line in lines:
+                ax.text(x + 0.02, cy, line, transform=ax.transAxes, fontsize=10.5, color="#202a36", va="top")
+                cy -= 0.034
+
         with PdfPages(pdf_path) as pdf:
-            # Page 1: Executive Summary
-            fig, ax = plt.subplots(figsize=(8.27, 11.69))
+            fig, ax = plt.subplots(figsize=(8.27, 11.69), facecolor="#ffffff")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
             ax.axis("off")
-            ax.text(0.05, 0.95, "MECH-AI Engineering Analysis", fontsize=22, fontweight="bold", color="#1a2332")
-            ax.text(0.05, 0.92, f"Structural Report | {datetime.now().strftime('%Y-%m-%d %H:%M')}", fontsize=10, color="#666")
-            
-            # Parameters
-            ax.text(0.05, 0.88, "1. SYSTEM CONFIGURATION", fontsize=14, fontweight="bold")
-            ax.text(0.07, 0.82, 
-                f"Component Type: {component_type.upper()}\n"
-                f"Load Applied: {load:.0f} N ({load_type})\n"
-                f"Environment: {temperature:.1f} C", fontsize=11, linespacing=1.6)
 
-            # Results
-            ax.text(0.05, 0.75, "2. PERFORMANCE METRICS", fontsize=14, fontweight="bold")
-            ax.text(0.07, 0.68, 
-                f"Safety Factor: {float(safety_factor):.3f}\n"
-                f"Peak Stress: {float(stress_mpa):.2f} MPa\n"
-                f"Material Yield: {float(yield_mpa):.1f} MPa", fontsize=11, linespacing=1.6)
+            ax.add_patch(plt.Rectangle((0, 0.875), 1, 0.125, transform=ax.transAxes, facecolor="#111820", edgecolor="none"))
+            ax.add_patch(plt.Rectangle((0, 0.872), 1, 0.006, transform=ax.transAxes, facecolor="#22d3a0", edgecolor="none"))
+            ax.text(0.055, 0.94, "MECH-AI Engineering Analysis", transform=ax.transAxes, fontsize=22, fontweight="bold", color="#e7eef7", va="center")
+            ax.text(0.058, 0.902, "Structural simulation report", transform=ax.transAxes, fontsize=10, color="#9fb0c2", va="center")
+            ax.text(0.84, 0.905, datetime.now().strftime("%Y-%m-%d %H:%M"), transform=ax.transAxes, fontsize=9, color="#9fb0c2", ha="right")
 
-            # AI Text
-            ax.text(0.05, 0.60, "3. AI ASSESSMENT", fontsize=14, fontweight="bold")
-            curr_y = 0.57
-            for line in report_lines:
-                if curr_y < 0.08:
-                    break
-                wrapped = [line[i:i + 88] for i in range(0, len(line), 88)] if line else [""]
-                for wline in wrapped:
-                    if curr_y < 0.08:
+            status = "SAFE" if float(safety_factor) >= 2 else "CAUTION" if float(safety_factor) >= 1 else "FAIL"
+            status_color = "#22d3a0" if status == "SAFE" else "#f59e0b" if status == "CAUTION" else "#ef4444"
+            ax.add_patch(plt.Rectangle((0.74, 0.91), 0.18, 0.045, transform=ax.transAxes, facecolor=status_color, edgecolor="none"))
+            ax.text(0.83, 0.932, status, transform=ax.transAxes, ha="center", va="center", fontsize=12, fontweight="bold", color="#ffffff")
+
+            card(
+                ax, 0.055, 0.825, 0.41, 0.18, "System Configuration",
+                [
+                    f"Component: {str(component_type).upper()}",
+                    f"Load: {float(load):,.0f} N",
+                    f"Load type: {load_type}",
+                    f"Temperature: {float(temperature):.1f} C",
+                ],
+                accent="#3b82f6",
+            )
+            card(
+                ax, 0.535, 0.825, 0.41, 0.18, "Performance Metrics",
+                [
+                    f"Safety factor: {float(safety_factor):.3f}",
+                    f"Peak stress: {float(stress_mpa):.2f} MPa",
+                    f"Strain: {float(strain):.6f}",
+                    f"Material yield: {float(yield_mpa):.1f} MPa",
+                ],
+                accent=status_color,
+            )
+
+            ax.text(0.055, 0.585, "AI Assessment", transform=ax.transAxes, fontsize=14, fontweight="bold", color="#111820")
+            ax.add_patch(plt.Rectangle((0.055, 0.105), 0.89, 0.455, transform=ax.transAxes, facecolor="#fbfcfe", edgecolor="#d5dee8", linewidth=1.0))
+            y = 0.532
+            for line in report_lines[:22]:
+                for wrapped in textwrap.wrap(line, width=92) or [""]:
+                    if y < 0.13:
                         break
-                    ax.text(0.07, curr_y, wline, fontsize=10)
-                    curr_y -= 0.018
-            
-            pdf.savefig(fig)
+                    ax.text(0.082, y, wrapped, transform=ax.transAxes, fontsize=9.7, color="#293545", va="top")
+                    y -= 0.026
+                if y < 0.13:
+                    break
+
+            footer(fig)
+            pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
-            # Additional Pages: Plots
             print("[Sim] Appending visual plots to PDF...")
             for plot_fig in [sf_curve, deform_curve, heatmap_plot, compliance_gauge]:
                 if plot_fig is not None:
                     try:
+                        plot_fig.set_facecolor("#ffffff")
+                        footer(plot_fig)
                         pdf.savefig(plot_fig, bbox_inches="tight")
                     except Exception as e:
                         print(f"[Sim] Plot save error: {e}")
@@ -1697,20 +1723,20 @@ def generate_simulation_report_pdf(
 
     except Exception as e:
         print(f"[Sim] CRITICAL REPORT ERROR: {str(e)}")
-        # Return a simple error PDF so the user isn't stuck with an 'Error' button
         fd, err_pdf = tempfile.mkstemp(prefix="mechai_error_", suffix=".pdf")
         os.close(fd)
         try:
             with PdfPages(err_pdf) as pdf:
-                fig, ax = plt.subplots(figsize=(8, 6))
-                ax.text(0.1, 0.5, f"REPORT FAILED\n\nError: {str(e)}", fontsize=14, color='red')
-                ax.axis('off')
-                pdf.savefig(fig)
+                fig, ax = plt.subplots(figsize=(8, 6), facecolor="#ffffff")
+                ax.axis("off")
+                ax.text(0.08, 0.72, "MECH-AI Report Failed", fontsize=18, fontweight="bold", color="#ef4444")
+                ax.text(0.08, 0.55, textwrap.fill(str(e), width=80), fontsize=11, color="#202a36")
+                fig.text(0.5, 0.04, "Made by MECH-AI", ha="center", fontsize=9, color="#617080", fontweight="bold")
+                pdf.savefig(fig, bbox_inches="tight")
                 plt.close(fig)
             return err_pdf
-        except:
+        except Exception:
             return None
-
 
 def build_simulation_tab(default_component: str = "bolt"):
     """
@@ -1738,3 +1764,4 @@ def build_simulation_tab(default_component: str = "bolt"):
             run_btn = gr.Button("Run Simulation", variant="primary")
         sim_html = gr.HTML(label="Simulation View")
         run_btn.click(fn=_render_simulation_html, inputs=[load_type, deform_scale], outputs=sim_html)
+
