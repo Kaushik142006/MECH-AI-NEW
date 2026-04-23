@@ -1660,14 +1660,14 @@ def generate_simulation_report_pdf(
 
             ax.add_patch(plt.Rectangle((0, 0.875), 1, 0.125, transform=ax.transAxes, facecolor="#111820", edgecolor="none"))
             ax.add_patch(plt.Rectangle((0, 0.872), 1, 0.006, transform=ax.transAxes, facecolor="#22d3a0", edgecolor="none"))
-            ax.text(0.055, 0.94, "MECH-AI Engineering Analysis", transform=ax.transAxes, fontsize=22, fontweight="bold", color="#e7eef7", va="center")
+            ax.text(0.055, 0.94, "MECH-AI Engineering Analysis", transform=ax.transAxes, fontsize=18, fontweight="bold", color="#e7eef7", va="center")
             ax.text(0.058, 0.902, "Structural simulation report", transform=ax.transAxes, fontsize=10, color="#9fb0c2", va="center")
-            ax.text(0.84, 0.905, datetime.now().strftime("%Y-%m-%d %H:%M"), transform=ax.transAxes, fontsize=9, color="#9fb0c2", ha="right")
 
             status = "SAFE" if float(safety_factor) >= 2 else "CAUTION" if float(safety_factor) >= 1 else "FAIL"
             status_color = "#22d3a0" if status == "SAFE" else "#f59e0b" if status == "CAUTION" else "#ef4444"
-            ax.add_patch(plt.Rectangle((0.74, 0.91), 0.18, 0.045, transform=ax.transAxes, facecolor=status_color, edgecolor="none"))
-            ax.text(0.83, 0.932, status, transform=ax.transAxes, ha="center", va="center", fontsize=12, fontweight="bold", color="#ffffff")
+            ax.add_patch(plt.Rectangle((0.79, 0.92), 0.16, 0.042, transform=ax.transAxes, facecolor=status_color, edgecolor="none"))
+            ax.text(0.87, 0.941, status, transform=ax.transAxes, ha="center", va="center", fontsize=11, fontweight="bold", color="#ffffff")
+            ax.text(0.95, 0.898, datetime.now().strftime("%Y-%m-%d %H:%M"), transform=ax.transAxes, fontsize=9, color="#9fb0c2", ha="right", va="center")
 
             card(
                 ax, 0.055, 0.825, 0.41, 0.18, "System Configuration",
